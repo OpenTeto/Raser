@@ -826,6 +826,8 @@ body.perf .app-icon-option-box {
   -webkit-app-region: no-drag !important;
   pointer-events: auto !important;
   margin: 2px 0;
+  padding: 6px 10px;
+  box-sizing: border-box;
 }
 .rail-playlists-scroll::-webkit-scrollbar {
   display: none;
@@ -900,9 +902,7 @@ body.perf .app-icon-option-box {
   display: block;
 }
 .rail-playlist-tooltip {
-  position: absolute;
-  left: calc(100% + 12px);
-  top: 50%;
+  position: fixed !important;
   transform: translateY(-50%) translateX(-6px);
   background: #1c1b1f !important;
   background-color: #1c1b1f !important;
@@ -918,7 +918,7 @@ body.perf .app-icon-option-box {
   opacity: 0;
   visibility: hidden;
   transition: opacity 0.18s ease, transform 0.18s cubic-bezier(0.2, 0, 0, 1), visibility 0.18s;
-  z-index: 10000000 !important;
+  z-index: 99999999 !important;
   display: flex;
   flex-direction: column;
   gap: 3px;
@@ -3782,11 +3782,12 @@ body.perf .playbar .time-label { transition: none !important; }
   font-size: calc(11px * var(--font-scale, 1));
   color: var(--md-sys-color-outline);
 }
-.setting-hint {
-  font-size: calc(12px * var(--font-scale, 1)) !important;
-  color: var(--md-sys-color-outline) !important;
-  opacity: 0.78 !important;
-  line-height: 1.35 !important;
+.setting-hint,
+.setting-desc {
+  font-size: calc(12.5px * var(--font-scale, 1)) !important;
+  color: var(--md-sys-color-on-surface-variant, rgba(255, 255, 255, 0.78)) !important;
+  opacity: 0.94 !important;
+  line-height: 1.4 !important;
   font-weight: 400 !important;
 }
 

@@ -8060,10 +8060,18 @@ document.addEventListener('DOMContentLoaded', async () => {
           playPromise.catch(e => {
             if (curToken !== smoothFadeToken || !el.nativeAudio?.paused) return;
             console.warn('Play error:', e);
+            const msg = (e && e.message) || '';
+            if (msg.includes('no supported source') || e?.name === 'NotSupportedError') {
+              console.log('[AudioEngine] Intercepted unsupported source error, silently recovering stream...');
+              if (typeof recoverCurrentStream === 'function') {
+                recoverCurrentStream(0);
+                return;
+              }
+            }
             state.isPlaying = false;
             updatePlayPauseButton(false, false);
             if (el.trackLoadingOverlay) el.trackLoadingOverlay.classList.add('hidden');
-            showToast(e.message || 'Could not start playback', 'error');
+            showToast(msg || 'Could not start playback', 'error');
           });
         }
       } catch (e) {
@@ -8510,7 +8518,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         try {
           const qQuality = encodeURIComponent(localStorage.getItem('riff_audio_quality') || 'medium');
           const qSearch = encodeURIComponent(cur.searchQuery || ((cur.artist ? cur.artist + ' - ' : '') + (cur.title || '')));
-          const retryUrl = `${getApiBaseUrl()}/api/stream-info?url=${encodeURIComponent(cur.url || '')}&id=${encodeURIComponent(cur.id || '')}&platform=${encodeURIComponent(cur.platform || state.platform)}&title=${encodeURIComponent(cur.title || '')}&artist=${encodeURIComponent(cur.artist || '')}&duration=${encodeURIComponent(cur.duration || 0)}&quality=${qQuality}&q=${qSearch}&forceYtDlp=1`;
+          const retryUrl = `${getApiBaseUrl()}/api/stream-info?url=${encodeURIComponent(cur.url || '')}&id=${encodeURIComponent(cur.id || '')}&platform=${encodeURIComponent(cur.platform || state.platform)}&title=${encodeURIComponent(cur.title || '')}&artist=${encodeURIComponent(cur.artist || '')}&duration=${encodeURIComponent(cur.duration || 0)}&quality=${qQuality}&q=${qSearch}&forceYtDlp=1&refresh=1`;
           const r = await fetch(retryUrl, { signal: retryController.signal });
           const d = await r.json();
           if (myToken !== state.loadToken) return;
@@ -13294,6 +13302,12 @@ function renderClickableArtists(container, rawArtist, hintTrack = null) {
         <span class="rail-playlist-tooltip-meta">${countLabel}</span>
       `;
       item.appendChild(tooltip);
+
+      item.addEventListener('mouseenter', () => {
+        const rect = item.getBoundingClientRect();
+        tooltip.style.top = `${rect.top + rect.height / 2}px`;
+        tooltip.style.left = `${rect.right + 12}px`;
+      });
 
       item.addEventListener('click', () => {
         openPlaylistDetail(pl.id);
@@ -25616,8 +25630,7 @@ function bindCoverHoldZoom(wrapEl) {
     const generatedMixes = [];
     try {
       const profile = await computeTasteProfile();
-      for (let i = 0; i < buckets.length; i++) {
-        const bucket = buckets[i];
+      const bucketPromises = buckets.map(async (bucket, idx) => {
         const payload = {
           history: (state.history || []).slice(0, 30),
           favorites: (state.favorites || []).slice(0, 25),
@@ -25637,25 +25650,29 @@ function bindCoverHoldZoom(wrapEl) {
           });
           const data = await res.json();
           if (data && data.success && Array.isArray(data.tracks) && data.tracks.length >= 8) {
-            generatedMixes.push({
-              id: bucket.id || `daily-mix-${generatedMixes.length + 1}`,
-              title: `Daily Mix ${generatedMixes.length + 1}`,
+            return {
+              id: bucket.id || `daily-mix-${idx + 1}`,
+              title: `Daily Mix ${idx + 1}`,
               artists: bucket.artists,
-              tracks: data.tracks
-            });
-            localStorage.setItem(MIX_KEY, JSON.stringify({
-              day: today,
-              mixes: generatedMixes
-            }));
-            if (window.HomeCache) {
-              window.HomeCache.set('daily_mixes', { day: today, mixes: generatedMixes });
-            }
-            if (typeof renderMadeForYou === 'function') renderMadeForYou();
+              tracks: data.tracks,
+              idx
+            };
           }
         } catch (err) {
-          break;
+          console.warn('[DailyMix] Bucket fetch error:', err);
         }
+        return null;
+      });
+
+      const results = await Promise.all(bucketPromises);
+      for (const item of results) {
+        if (item) generatedMixes.push(item);
       }
+      generatedMixes.sort((a, b) => a.idx - b.idx);
+      generatedMixes.forEach((m, i) => {
+        m.title = `Daily Mix ${i + 1}`;
+        delete m.idx;
+      });
     } catch (err) {
     } finally {
       state.mixesBusy = false;

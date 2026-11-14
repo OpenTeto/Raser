@@ -15,12 +15,15 @@ pub struct DiscordTrackInfo {
     pub start_timestamp: Option<i64>,
     pub duration: Option<f64>,
     pub url: Option<String>,
+    #[serde(rename = "artistInStatus")]
+    pub artist_in_status: Option<bool>,
 }
 
 pub fn update_presence(track: DiscordTrackInfo) {
     std::thread::spawn(move || {
         let title = track.title.unwrap_or_else(|| "Unknown Track".into());
         let artist = track.artist.unwrap_or_else(|| "Unknown Artist".into());
+        let show_artist = track.artist_in_status.unwrap_or(true);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -60,11 +63,21 @@ pub fn update_presence(track: DiscordTrackInfo) {
             }
             assets = assets.large_text(&title);
 
+            let state_str = if show_artist && !artist.is_empty() {
+                Some(format!("by {}", artist))
+            } else {
+                None
+            };
+
             let mut act = activity::Activity::new()
+                .activity_type(activity::ActivityType::Listening)
                 .details(&title)
-                .state(&artist)
                 .timestamps(timestamps)
                 .assets(assets);
+
+            if let Some(s) = &state_str {
+                act = act.state(s);
+            }
 
             if let Some(u) = &track.url {
                 if u.starts_with("https://") {
