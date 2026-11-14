@@ -141,36 +141,12 @@
       if (!audioElement) return;
       this._attachedElement = audioElement;
 
-      if (!this.ctx) {
-        try {
-          const AC = window.AudioContext || window.webkitAudioContext;
-          this.ctx = new AC({ latencyHint: 'playback' });
-        } catch (_) {}
-      }
-
-      if (this.ctx && !this.analyserNode) {
-        try {
-          this.analyserNode = this.ctx.createAnalyser();
-          this.analyserNode.fftSize = 128;
-          this.analyserNode.smoothingTimeConstant = 0.8;
-        } catch (_) {}
-      }
-
-      if (!this.mediaSource && this.ctx && audioElement) {
-        try {
-          this.mediaSource = this.ctx.createMediaElementSource(audioElement);
-          if (this.analyserNode) {
-            this.mediaSource.connect(this.analyserNode);
-            this.analyserNode.connect(this.ctx.destination);
-          }
-          this.graphInitialized = true;
-        } catch (e) {
-          console.warn('[AudioEngine] MediaSource attach note:', e.message);
-        }
-      }
-
+      // Direct Native Audio Mode: Bypass Web Audio graph completely.
+      // Audio streams directly through Windows native WASAPI / Media Foundation!
+      this.graphInitialized = false;
       this.applySettings(audioElement);
       this._applyMasterVolume();
+      return;
     }
 
 
@@ -540,18 +516,10 @@
 
     getFrequencyData(buffer) {
       if (!buffer) return;
-      if (!this._analyserConnected) this.setAnalyserEnabled(true);
-      if (this.analyserNode) {
-        this.analyserNode.getByteFrequencyData(buffer);
-        let max = 0;
-        for (let i = 0; i < Math.min(buffer.length, 16); i++) {
-          if (buffer[i] > max) max = buffer[i];
-        }
-        if (max === 0 && this._attachedElement && !this._attachedElement.paused && (this._attachedElement.currentTime || 0) > 0) {
-          this._fillSyntheticFrequencies(buffer);
-        }
-      } else if (this._attachedElement && !this._attachedElement.paused) {
+      if (this._attachedElement && !this._attachedElement.paused && (this._attachedElement.currentTime || 0) > 0) {
         this._fillSyntheticFrequencies(buffer);
+      } else {
+        buffer.fill(0);
       }
     }
 

@@ -61,7 +61,7 @@ pub fn update_presence(track: DiscordTrackInfo) {
                     assets = assets.large_image(thumb);
                 }
             }
-            assets = assets.large_text(&title);
+            assets = assets.large_text("Raser");
 
             let state_str = if show_artist && !artist.is_empty() {
                 Some(format!("by {}", artist))
