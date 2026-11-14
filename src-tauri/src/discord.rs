@@ -1,4 +1,5 @@
-use discord_rich_presence::{activity, DiscordIpc, DiscordIpcClient};
+use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
+use serde_json::json;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -48,45 +49,64 @@ pub fn update_presence(track: DiscordTrackInfo) {
         }
 
         if let Some(client) = lock.as_mut() {
-            let mut timestamps = activity::Timestamps::new().start(start);
+            let mut timestamps_val = json!({ "start": start });
             if let Some(dur) = track.duration {
                 if dur > 0.0 {
-                    timestamps = timestamps.end(start + dur as i64);
+                    timestamps_val = json!({
+                        "start": start,
+                        "end": start + dur as i64
+                    });
                 }
             }
 
-            let mut assets = activity::Assets::new();
+            let mut assets_val = json!({});
             if let Some(thumb) = &track.thumbnail {
                 if !thumb.is_empty() {
-                    assets = assets.large_image(thumb);
+                    assets_val["large_image"] = json!(thumb);
                 }
             }
-            assets = assets.large_text("Raser");
 
-            let state_str = if show_artist && !artist.is_empty() {
-                Some(format!("by {}", artist))
-            } else {
-                None
-            };
+            // status_display_type:
+            // 0: Application Name ("Raser")
+            // 1: state ("Sanatçı")
+            // 2: details ("Şarkı")
+            let status_display_type = if show_artist && !artist.is_empty() { 1 } else { 0 };
 
-            let mut act = activity::Activity::new()
-                .activity_type(activity::ActivityType::Listening)
-                .details(&title)
-                .timestamps(timestamps)
-                .assets(assets);
+            let mut activity_obj = json!({
+                "type": 2, // Listening
+                "status_display_type": status_display_type,
+                "details": title,
+                "timestamps": timestamps_val,
+                "assets": assets_val
+            });
 
-            if let Some(s) = &state_str {
-                act = act.state(s);
+            if !artist.is_empty() {
+                activity_obj["state"] = json!(artist);
             }
 
             if let Some(u) = &track.url {
                 if u.starts_with("https://") {
-                    act = act.buttons(vec![activity::Button::new("Listen", u)]);
+                    activity_obj["buttons"] = json!([
+                        {
+                            "label": "Listen",
+                            "url": u
+                        }
+                    ]);
                 }
             }
 
-            if client.set_activity(act).is_err() {
-                // If set_activity failed, disconnect and reset so next call can reconnect
+            let nonce = format!("{}-{}", std::process::id(), now);
+            let payload = json!({
+                "cmd": "SET_ACTIVITY",
+                "args": {
+                    "pid": std::process::id(),
+                    "activity": activity_obj
+                },
+                "nonce": nonce
+            });
+
+            // Opcode 1 for frame payload
+            if client.send(payload, 1).is_err() {
                 let _ = client.close();
                 *lock = None;
             }

@@ -17,9 +17,15 @@
     mediaCommandListeners.forEach(fn => {
       try { fn(cmd); } catch (_) {}
     });
+    if (typeof window.__raserMediaCommand === 'function' && window.__raserMediaCommand !== handleMediaDispatch) {
+      try { window.__raserMediaCommand(cmd); } catch (_) {}
+    }
   }
 
-  window.__raserMediaCommand = handleMediaDispatch;
+  window.__raserMediaDispatch = handleMediaDispatch;
+  if (!window.__raserMediaCommand) {
+    window.__raserMediaCommand = handleMediaDispatch;
+  }
 
   const setupTauriEventListener = () => {
     if (window.__TAURI__ && window.__TAURI__.event && typeof window.__TAURI__.event.listen === 'function') {
@@ -39,6 +45,8 @@
     minimizeWindow: () => invoke('minimize_window'),
     maximizeWindow: () => invoke('toggle_maximize_window'),
     closeWindow: () => invoke('close_window'),
+    taskbarPlaybackState: (playing) => invoke('taskbar_playback_state', { playing: !!playing }),
+    updateTaskbarState: (playing) => invoke('taskbar_playback_state', { playing: !!playing }),
     onMediaCommand: (cb) => {
       if (typeof cb === 'function') mediaCommandListeners.push(cb);
     },
@@ -109,7 +117,6 @@
     storageSaveBatch: (data) => {
       invoke('save_disk_storage', { data });
     },
-    updateTaskbarState: (playing) => invoke('taskbar_playback_state', { playing: !!playing }),
     setThumbarButtons: () => {},
     getCacheSize: async () => 0,
     clearCache: async () => {}
