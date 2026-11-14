@@ -7,7 +7,7 @@ function getApiBaseUrl(port) {
     const p = port || (typeof state !== 'undefined' ? state.serverPort : null);
     if (p) return 'http://127.0.0.1:' + p;
   }
-  if (typeof window !== 'undefined' && window.location && window.location.origin && window.location.origin !== 'null' && !window.location.origin.includes('localhost') && !window.location.origin.includes('tauri')) {
+  if (typeof window !== 'undefined' && window.location && window.location.origin && window.location.origin !== 'null' && !window.location.origin.includes('tauri')) {
     return window.location.origin;
   }
   return 'https://app.raserapp.online';
@@ -290,6 +290,16 @@ const HomeCache = {
   },
   set(key, data) {
     this.store[key] = { ts: Date.now(), data };
+    try {
+      if (window.electronAPI && window.electronAPI.writeCacheFile) {
+        window.electronAPI.writeCacheFile(this.store);
+      }
+    } catch (_) {}
+  },
+  delete(key) {
+    if (this.store && key in this.store) {
+      delete this.store[key];
+    }
     try {
       if (window.electronAPI && window.electronAPI.writeCacheFile) {
         window.electronAPI.writeCacheFile(this.store);
@@ -2331,7 +2341,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   };
   if (el.nativeAudio) {
     el.nativeAudio.preload = 'auto';
-    el.nativeAudio.crossOrigin = 'anonymous';
   }
 
 
@@ -3538,7 +3547,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           cur = frozenCurTime;
         }
 
-        if (isDraggingScrubber && state.scrubberDragTargetTime !== undefined) {
+        if ((isDraggingScrubber || (el.nativeAudio && el.nativeAudio.seeking)) && state.scrubberDragTargetTime !== undefined) {
           cur = state.scrubberDragTargetTime;
           const t = formatDuration(cur);
           if (el.timeCurrent && el.timeCurrent.textContent !== t) el.timeCurrent.textContent = t;
@@ -4692,8 +4701,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     try {
       el.nativeAudio.pause();
-      el.nativeAudio.removeAttribute('src');
-      el.nativeAudio.load();
     } catch (e) {}
 
     if (hlsInstance) {
@@ -4862,73 +4869,129 @@ document.addEventListener('DOMContentLoaded', async () => {
       let resolvedUrl = track.url;
       let resolvedId = track.resolvedId || track.id;
 
-      const qQuality = encodeURIComponent(localStorage.getItem('riff_audio_quality') || 'medium');
-      const qSearch = encodeURIComponent(track.searchQuery || ((track.artist ? track.artist + ' - ' : '') + track.title));
-      const streamInfoUrl = `${getApiBaseUrl()}/api/stream-info?url=${encodeURIComponent(resolvedUrl || '')}&id=${encodeURIComponent(resolvedId || '')}&platform=${(state.platform === 'soundcloud' && (!track.url || !track.url.includes('youtube.com'))) ? 'soundcloud' : (track.platform || state.platform || 'ytmusic')}&title=${encodeURIComponent(track.title || '')}&artist=${encodeURIComponent(track.artist || '')}&duration=${encodeURIComponent(track.duration || 0)}&thumbnail=${encodeURIComponent(track.thumbnail || '')}&quality=${qQuality}&q=${qSearch}`;
-      let res;
-      try {
-        res = await fetch(streamInfoUrl, { signal });
-      } catch (fetchErr) {
-        if (fetchErr instanceof TypeError) {
-          await new Promise(r => setTimeout(r, 600));
+      const isSoundcloudTrack = (state.platform === 'soundcloud' && (!track.url || !track.url.includes('youtube.com'))) ||
+                                (track.platform === 'soundcloud') ||
+                                (track.url && track.url.includes('soundcloud.com'));
+
+      if (isSoundcloudTrack) {
+        if (hlsInstance) {
+          try { hlsInstance.destroy(); } catch (_) {}
+          hlsInstance = null;
+        }
+        const qQuality = encodeURIComponent(localStorage.getItem('riff_audio_quality') || 'medium');
+        const qSearch = encodeURIComponent(track.searchQuery || ((track.artist ? track.artist + ' - ' : '') + track.title));
+        const streamInfoUrl = `${getApiBaseUrl()}/api/stream-info?url=${encodeURIComponent(resolvedUrl || '')}&id=${encodeURIComponent(resolvedId || '')}&platform=soundcloud&title=${encodeURIComponent(track.title || '')}&artist=${encodeURIComponent(track.artist || '')}&duration=${encodeURIComponent(track.duration || 0)}&thumbnail=${encodeURIComponent(track.thumbnail || '')}&quality=${qQuality}&q=${qSearch}`;
+        let res;
+        try {
           res = await fetch(streamInfoUrl, { signal });
+        } catch (fetchErr) {
+          if (fetchErr instanceof TypeError) {
+            await new Promise(r => setTimeout(r, 600));
+            res = await fetch(streamInfoUrl, { signal });
+          } else {
+            throw fetchErr;
+          }
+        }
+        const data = await res.json();
+        if (currentToken !== state.loadToken) return;
+        if (!data || !data.success || !data.streamUrl) {
+          throw new Error((data && data.error) || 'Failed to extract SoundCloud stream');
+        }
+        data.streamUrl = ensureAbsoluteStreamUrl(data.streamUrl);
+        if (data.resolvedId) track.resolvedId = data.resolvedId;
+        track._preloadedStreamUrl = data.streamUrl;
+
+        el.nativeAudio.preload = 'auto';
+        if ((data.isHls || data.streamUrl.includes('.m3u8')) && window.Hls && Hls.isSupported()) {
+          hlsInstance = new Hls({ enableWorker: true, lowLatencyMode: true, maxBufferLength: 30, maxMaxBufferLength: 60, maxBufferSize: 30 * 1000 * 1000 });
+          hlsInstance.on(Hls.Events.ERROR, (_, errData) => {
+            if (errData && errData.fatal) {
+              if (errData.type === Hls.ErrorTypes.NETWORK_ERROR) hlsInstance.startLoad();
+              else if (errData.type === Hls.ErrorTypes.MEDIA_ERROR) hlsInstance.recoverMediaError();
+            }
+          });
+          hlsInstance.loadSource(data.streamUrl);
+          hlsInstance.attachMedia(el.nativeAudio);
+          hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+            if (currentToken === state.loadToken) {
+              playSmooth();
+            }
+          });
         } else {
-          throw fetchErr;
+          el.nativeAudio.src = data.streamUrl;
+          playSmooth();
         }
+        applyAudioSettings();
+        return;
       }
-      const data = await res.json();
-
-      if (currentToken !== state.loadToken) return;
-
-      if (!data || !data.success || !data.streamUrl) {
-        if (!navigator.onLine) {
-          showToast('Offline: this track is not available in local cache');
-          throw new Error('Offline: track not cached locally');
-        }
-        throw new Error((data && data.error) || 'Failed to extract audio stream');
-      }
-
-      data.streamUrl = ensureAbsoluteStreamUrl(data.streamUrl);
-
-      if (data.resolvedId) {
-        track.resolvedId = data.resolvedId;
-      }
-
-      track._preloadedStreamUrl = data.streamUrl;
 
       if (hlsInstance) {
-        hlsInstance.destroy();
+        try { hlsInstance.destroy(); } catch (_) {}
         hlsInstance = null;
       }
 
       el.nativeAudio.preload = 'auto';
-
-      if (data.isHls && window.Hls && Hls.isSupported()) {
-        hlsInstance = new Hls({ enableWorker: true, lowLatencyMode: true, maxBufferLength: 30, maxMaxBufferLength: 60, maxBufferSize: 30 * 1000 * 1000 });
-        hlsInstance.on(Hls.Events.ERROR, (_, errData) => {
-          if (errData && errData.fatal) {
-            if (errData.type === Hls.ErrorTypes.NETWORK_ERROR) hlsInstance.startLoad();
-            else if (errData.type === Hls.ErrorTypes.MEDIA_ERROR) hlsInstance.recoverMediaError();
-          }
-        });
-        hlsInstance.loadSource(data.streamUrl);
-        hlsInstance.attachMedia(el.nativeAudio);
-        hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
-          if (currentToken === state.loadToken) {
-            playSmooth();
-          }
-        });
-      } else {
-        el.nativeAudio.src = data.streamUrl;
-        playSmooth();
-        setTimeout(() => {
-          if (state.isPlaying && state.currentTrack === track) {
-            bufferTrackToBlob(track, data.streamUrl).catch(() => {});
-          }
-        }, 4000);
-      }
-
+      const playUrl = `${getApiBaseUrl()}/api/stream?id=${encodeURIComponent(resolvedId || track.id || '')}&title=${encodeURIComponent(track.title || '')}&artist=${encodeURIComponent(track.artist || '')}${track.url ? '&url=' + encodeURIComponent(track.url) : ''}${track.platform ? '&platform=' + encodeURIComponent(track.platform) : ''}`;
+      el.nativeAudio.src = playUrl;
+      playSmooth();
       applyAudioSettings();
+
+      setTimeout(() => {
+        if (state.isPlaying && state.currentTrack === track) {
+          bufferTrackToBlob(track, playUrl).catch(() => {});
+        }
+      }, 4000);
+
+      // Supplementary stream-info resolution in background (for caching / metadata only, never disrupt playing stream!)
+      (async () => {
+        try {
+          const qQuality = encodeURIComponent(localStorage.getItem('riff_audio_quality') || 'medium');
+          const qSearch = encodeURIComponent(track.searchQuery || ((track.artist ? track.artist + ' - ' : '') + track.title));
+          const streamInfoUrl = `${getApiBaseUrl()}/api/stream-info?url=${encodeURIComponent(resolvedUrl || '')}&id=${encodeURIComponent(resolvedId || '')}&platform=${track.platform || state.platform || 'ytmusic'}&title=${encodeURIComponent(track.title || '')}&artist=${encodeURIComponent(track.artist || '')}&duration=${encodeURIComponent(track.duration || 0)}&thumbnail=${encodeURIComponent(track.thumbnail || '')}&quality=${qQuality}&q=${qSearch}`;
+          let res;
+          try {
+            res = await fetch(streamInfoUrl, { signal });
+          } catch (fetchErr) {
+            if (fetchErr instanceof TypeError) {
+              await new Promise(r => setTimeout(r, 600));
+              res = await fetch(streamInfoUrl, { signal });
+            } else {
+              return;
+            }
+          }
+          const data = await res.json();
+          if (currentToken !== state.loadToken) return;
+
+          if (data && data.success && data.streamUrl) {
+            data.streamUrl = ensureAbsoluteStreamUrl(data.streamUrl);
+            if (data.resolvedId) track.resolvedId = data.resolvedId;
+            track._preloadedStreamUrl = data.streamUrl;
+
+            // Only attach HLS if the native audio stream is NOT already playing smoothly!
+            const isPlayingHealthy = el.nativeAudio && !el.nativeAudio.paused && !el.nativeAudio.error && el.nativeAudio.currentTime > 0.1;
+            if (!isPlayingHealthy && data.isHls && window.Hls && Hls.isSupported()) {
+              if (hlsInstance) {
+                try { hlsInstance.destroy(); } catch (_) {}
+                hlsInstance = null;
+              }
+              hlsInstance = new Hls({ enableWorker: true, lowLatencyMode: true, maxBufferLength: 30, maxMaxBufferLength: 60, maxBufferSize: 30 * 1000 * 1000 });
+              hlsInstance.on(Hls.Events.ERROR, (_, errData) => {
+                if (errData && errData.fatal) {
+                  if (errData.type === Hls.ErrorTypes.NETWORK_ERROR) hlsInstance.startLoad();
+                  else if (errData.type === Hls.ErrorTypes.MEDIA_ERROR) hlsInstance.recoverMediaError();
+                }
+              });
+              hlsInstance.loadSource(data.streamUrl);
+              hlsInstance.attachMedia(el.nativeAudio);
+              hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+                if (currentToken === state.loadToken) {
+                  playSmooth();
+                }
+              });
+            }
+          }
+        } catch (_) {}
+      })();
     } catch (err) {
       if (err.name === 'AbortError' && !didTimeoutAbort) return;
       if (currentToken === state.loadToken) {
@@ -8059,6 +8122,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (playPromise && typeof playPromise.catch === 'function') {
           playPromise.catch(e => {
             if (curToken !== smoothFadeToken || !el.nativeAudio?.paused) return;
+            if (e?.name === 'AbortError' || (e?.message && e.message.includes('interrupted'))) return;
             console.warn('Play error:', e);
             const msg = (e && e.message) || '';
             if (msg.includes('no supported source') || e?.name === 'NotSupportedError') {
@@ -8075,6 +8139,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           });
         }
       } catch (e) {
+        if (e?.name === 'AbortError' || (e?.message && e.message.includes('interrupted'))) return;
         console.warn('Play error:', e);
       }
     }
@@ -8381,11 +8446,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         } else {
           if (state._isNaturalEnding) {
             if (autoplayEnabled() && await startAutoplay()) return;
-            pauseSmooth();
-            if (el.nativeAudio) el.nativeAudio.currentTime = 0;
-            return;
           }
-          nextIdx = 0;
+          pauseSmooth();
+          if (el.nativeAudio) el.nativeAudio.currentTime = 0;
+          return;
         }
       }
       const candidate = state.queue[nextIdx];
@@ -8507,6 +8571,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         showToast('File missing from library', 'error');
         return;
       }
+
+      // If audio is already actively playing and healthy, do not interrupt!
+      if (el.nativeAudio && !el.nativeAudio.paused && !el.nativeAudio.error && !el.nativeAudio.ended && el.nativeAudio.currentTime > 0.5) {
+        state.isPlaying = true;
+        updatePlayPauseButton(true, false);
+        return;
+      }
+
       delete cur._preloadedStreamUrl;
       const retryStage = cur._errorRetryStage || 0;
 
@@ -8560,13 +8632,21 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
 
       cur._errorRetryStage = 0;
+
+      // Check if audio actually started playing in background
+      if (el.nativeAudio && !el.nativeAudio.paused && !el.nativeAudio.error && !el.nativeAudio.ended && el.nativeAudio.currentTime > 0.5) {
+        state.isPlaying = true;
+        updatePlayPauseButton(true, false);
+        return;
+      }
+
+      try { el.nativeAudio.pause(); } catch (_) {}
+      if (hlsInstance) {
+        try { hlsInstance.stopLoad(); hlsInstance.destroy(); } catch (_) {}
+        hlsInstance = null;
+      }
       state.isPlaying = false;
       updatePlayPauseButton(false, false);
-      
-
-      
-
-      
 
       state.consecutivePlayFailures = (state.consecutivePlayFailures || 0) + 1;
       const maxAutoSkips = Math.min(5, Math.max(1, (state.queue && state.queue.length) || 1));
@@ -8626,18 +8706,16 @@ document.addEventListener('DOMContentLoaded', async () => {
       clearPlaybackStallTimer();
       state.isPlaying = true;
       state.consecutivePlayFailures = 0;
+      if (state.currentTrack) {
+        state.currentTrack._errorRetryStage = 0;
+      }
+      state._streamRecoverCount = 0;
       if (!preloadedTrack10sFired) {
         preloadedTrack10sFired = true;
         preloadNextTrackStream();
       }
       document.body.classList.add('is-playing');
       updatePlayPauseButton(true, false);
-      // Start resolving the next track as soon as playback begins instead of
-      // waiting 10s, so the following track starts without a pause.
-      if (!preloadedTrack10sFired) {
-        preloadedTrack10sFired = true;
-        preloadNextTrackStream();
-      }
     });
 
     el.nativeAudio.addEventListener('canplay', () => {
@@ -8825,6 +8903,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
 
     el.nativeAudio.addEventListener('seeked', () => {
+      state.scrubberDragTargetTime = undefined;
+      const cur = (el.nativeAudio && Number.isFinite(el.nativeAudio.currentTime)) ? el.nativeAudio.currentTime : 0;
+      if (el.timeCurrent) el.timeCurrent.textContent = formatDuration(cur);
+      if (el.tvkTimeCurrent) el.tvkTimeCurrent.textContent = formatDuration(cur);
+      if (!state.isPlaying) {
+        hasDrawnPausedFrame = false;
+        if (!animationFrameId && typeof startVisualizers === 'function') {
+          startVisualizers();
+        }
+      }
       updateMediaPositionState();
       state.forceLyricsScroll = true;
       state.forceSnapLyrics = true;
@@ -8923,9 +9011,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const trackWidth = rect.width - 2 * padLeft;
     let pos = trackWidth > 0 ? (e.clientX - rect.left - padLeft) / trackWidth : 0;
     pos = Math.max(0, Math.min(1, pos));
-    const dur = (el.nativeAudio && Number.isFinite(el.nativeAudio.duration) && el.nativeAudio.duration > 0)
-      ? el.nativeAudio.duration
-      : (state.currentTrack && Number.isFinite(state.currentTrack.duration) ? state.currentTrack.duration : 0);
+    const dur = getReliableTrackDuration();
     const hoverTime = pos * dur;
     tooltip.textContent = formatDuration(hoverTime);
     const clampedX = Math.max(padLeft, Math.min(rect.width - padLeft, e.clientX - rect.left));
@@ -8940,9 +9026,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const trackWidth = rect.width - 2 * padLeft;
     let pos = trackWidth > 0 ? (e.clientX - rect.left - padLeft) / trackWidth : 0;
     pos = Math.max(0, Math.min(1, pos));
-    const dur = (el.nativeAudio && Number.isFinite(el.nativeAudio.duration) && el.nativeAudio.duration > 0)
-      ? el.nativeAudio.duration
-      : (state.currentTrack && Number.isFinite(state.currentTrack.duration) ? state.currentTrack.duration : 0);
+    const dur = getReliableTrackDuration();
     const targetTime = pos * dur;
 
     state.scrubberDragTargetTime = targetTime;
@@ -8991,9 +9075,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (el.scrubberTrack) el.scrubberTrack.classList.remove('dragging');
     const targetTime = updateScrubberPositionFromEvent(e);
     if (!isNaN(targetTime) && el.nativeAudio) {
+      state.scrubberDragTargetTime = targetTime;
       safeSeekTo(targetTime);
+    } else {
+      state.scrubberDragTargetTime = undefined;
     }
-    state.scrubberDragTargetTime = undefined;
   });
 
   let isDraggingTvkScrubber = false;
@@ -9033,9 +9119,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       isDraggingScrubber = false;
       const targetTime = updateTvkScrubberPositionFromEvent(e);
       if (!isNaN(targetTime) && el.nativeAudio) {
+        state.scrubberDragTargetTime = targetTime;
         safeSeekTo(targetTime);
+      } else {
+        state.scrubberDragTargetTime = undefined;
       }
-      state.scrubberDragTargetTime = undefined;
       try { tvkProgRowEl.releasePointerCapture(e.pointerId); } catch (_) {}
     };
     tvkProgRowEl.addEventListener('pointerup', finishTvkSeek);
@@ -11581,6 +11669,19 @@ document.addEventListener('DOMContentLoaded', async () => {
       return row;
   }
 
+  const activeScrollContainers = new Set();
+  function detachAllVirtualScrollHandlers() {
+    const scrollParent = document.querySelector('.main-content');
+    if (!scrollParent) return;
+    activeScrollContainers.forEach(c => {
+      if (c && c._vScrollHandler) {
+        scrollParent.removeEventListener('scroll', c._vScrollHandler);
+        c._vScrollHandler = null;
+      }
+    });
+    activeScrollContainers.clear();
+  }
+
   function renderTracks(container, tracks, context = 'search') {
     if (!container) return;
     
@@ -11590,6 +11691,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     const scrollParent = document.querySelector('.main-content');
     if (container._vScrollHandler && scrollParent) {
       scrollParent.removeEventListener('scroll', container._vScrollHandler);
+      container._vScrollHandler = null;
+      activeScrollContainers.delete(container);
     }
     
     container.innerHTML = '';
@@ -11759,7 +11862,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     container._renderChunk = renderChunk;
 
     container._vScrollHandler = () => {
-      if (!container.offsetParent) return;
+      if (!container.offsetParent || !container.isConnected) {
+        if (scrollParent && container._vScrollHandler) {
+          scrollParent.removeEventListener('scroll', container._vScrollHandler);
+          container._vScrollHandler = null;
+          activeScrollContainers.delete(container);
+        }
+        return;
+      }
       if (!container._ticking) {
         container._ticking = true;
         window.requestAnimationFrame(() => {
@@ -11775,6 +11885,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
     if (scrollParent) {
        scrollParent.addEventListener('scroll', container._vScrollHandler, { passive: true });
+       activeScrollContainers.add(container);
     }
     
     container._hasInitialRendered = false;
@@ -12785,12 +12896,12 @@ function renderClickableArtists(container, rawArtist, hintTrack = null) {
     const remapIndex = (index) => removed.has(index) ? -1 : index - removedBefore(index);
 
     state.queue = state.queue.filter((_, index) => !removed.has(index));
-    if (oldQueueIndex < 0) {
+    if (oldQueueIndex < 0 || state.queue.length === 0) {
       state.queueIndex = -1;
     } else if (removed.has(oldQueueIndex)) {
-      state.queueIndex = oldQueueIndex - removedBefore(oldQueueIndex) - 1;
+      state.queueIndex = Math.max(0, Math.min(state.queue.length - 1, oldQueueIndex - removedBefore(oldQueueIndex) - 1));
     } else {
-      state.queueIndex = remapIndex(oldQueueIndex);
+      state.queueIndex = Math.max(0, Math.min(state.queue.length - 1, remapIndex(oldQueueIndex)));
     }
     state.queueHistory = (Array.isArray(state.queueHistory) ? state.queueHistory : [])
       .map(remapIndex)
@@ -14104,6 +14215,7 @@ function renderClickableArtists(container, rawArtist, hintTrack = null) {
   }
 
   function switchView(viewName) {
+    if (typeof detachAllVirtualScrollHandlers === 'function') detachAllVirtualScrollHandlers();
     clearTrackSelection();
     if (state.currentView && state.currentView !== viewName) {
       state.previousView = state.currentView;
@@ -14990,11 +15102,15 @@ function bindCoverHoldZoom(wrapEl) {
   window.toggleShuffle = () => el.btnShuffle && el.btnShuffle.click();
   window.toggleRepeat = () => el.btnRepeat && el.btnRepeat.click();
 
+  let persistVolumeTimeout = null;
   function persistVolumeState() {
-    try {
-      localStorage.setItem('riff_volume', String(state.volume));
-      localStorage.setItem('riff_muted', state.isMuted ? '1' : '0');
-    } catch (e) {}
+    if (persistVolumeTimeout) clearTimeout(persistVolumeTimeout);
+    persistVolumeTimeout = setTimeout(() => {
+      try {
+        localStorage.setItem('riff_volume', String(state.volume));
+        localStorage.setItem('riff_muted', state.isMuted ? '1' : '0');
+      } catch (e) {}
+    }, 250);
   }
 
   function updateVolumeProgressFill() {
@@ -15002,6 +15118,7 @@ function bindCoverHoldZoom(wrapEl) {
     const vol = state.isMuted ? 0 : (Number.isFinite(state.volume) ? state.volume : 0);
     const pct = Math.max(0, Math.min(100, Math.round(vol * 100)));
     el.volumeSlider.style.setProperty('--volume-percent', `${pct}%`);
+    el.volumeSlider.value = state.isMuted ? '0' : String(Number.isFinite(state.volume) ? state.volume : 0);
     const volWrapper = el.volumeSlider.closest('.volume-slider-wrapper');
     if (volWrapper) {
       volWrapper.style.setProperty('--volume-percent', `${pct}%`);
@@ -18731,6 +18848,7 @@ function bindCoverHoldZoom(wrapEl) {
   window.renderMiniLyrics = renderMiniLyrics;
   window.updateMiniLyricsHighlight = updateMiniLyricsHighlight;
   window.setSyncedLyrics = (lyrics) => { state.syncedLyrics = lyrics; renderMiniLyrics(); };
+  window.state = state;
   window.playTrack = playTrack;
   window.safeSeekTo = safeSeekTo;
   window.applyPerfMode = applyPerfMode;
@@ -25607,7 +25725,11 @@ function bindCoverHoldZoom(wrapEl) {
       if (isIdentical || hasGenericYt) {
         cached = null;
         try { localStorage.removeItem(MIX_KEY); } catch (_) {}
-        if (window.HomeCache) window.HomeCache.delete('daily_mixes');
+        if (window.HomeCache && typeof window.HomeCache.delete === 'function') {
+          window.HomeCache.delete('daily_mixes');
+        } else if (window.HomeCache && window.HomeCache.store) {
+          delete window.HomeCache.store['daily_mixes'];
+        }
       }
     }
 
