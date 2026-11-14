@@ -4637,6 +4637,67 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  function scheduleBatchResolveIds(tracks) {
+    if (!Array.isArray(tracks) || tracks.length === 0) return;
+    const unresolved = tracks.filter(t => t && !t.resolvedId && (!t.id || !/^[a-zA-Z0-9_-]{11}$/.test(String(t.id)) || /^(cand_|dz_|it_|sp_|ym_)/i.test(String(t.id))));
+    if (unresolved.length === 0) return;
+
+    setTimeout(async () => {
+      try {
+        const payload = {
+          tracks: unresolved.slice(0, 30).map(t => ({
+            id: t.id,
+            title: t.title,
+            artist: t.artist
+          }))
+        };
+        const res = await fetch(`${getApiBaseUrl()}/api/resolve-ids`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (data && data.success && data.resolved) {
+          for (const t of unresolved) {
+            const match = data.resolved[t.id];
+            if (match) {
+              t.resolvedId = match;
+            }
+          }
+        }
+      } catch (_) {}
+    }, 80);
+  }
+
+  function attachTrackHoverPrefetch(domElement, track) {
+    if (!domElement || !track || track.platform === 'local') return;
+    let timer = null;
+    domElement.addEventListener('mouseenter', () => {
+      if (track._preloadedStreamUrl) return;
+      timer = setTimeout(() => {
+        const qFallback = track.searchQuery || ((track.artist ? track.artist + ' - ' : '') + track.title);
+        const targetId = track.resolvedId || track.id || '';
+        const prefetchUrl = `${getApiBaseUrl()}/api/stream-info?id=${encodeURIComponent(targetId)}&url=${encodeURIComponent(track.url || '')}&platform=${encodeURIComponent(track.platform || state.platform || 'youtube')}&title=${encodeURIComponent(track.title || '')}&artist=${encodeURIComponent(track.artist || '')}&duration=${encodeURIComponent(track.duration || 0)}&q=${encodeURIComponent(qFallback)}&format=json`;
+        fetch(prefetchUrl)
+          .then(r => r.ok ? r.json() : null)
+          .then(data => {
+            if (data && data.success && data.streamUrl) {
+              track._preloadedStreamUrl = ensureAbsoluteStreamUrl(data.streamUrl);
+              if (data.resolvedId) track.resolvedId = data.resolvedId;
+              track._preloadedStreamQuality = localStorage.getItem('riff_audio_quality') || 'medium';
+            }
+          })
+          .catch(() => {});
+      }, 60);
+    });
+    domElement.addEventListener('mouseleave', () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    });
+  }
+
   async function playTrack(track, queueList = null, startIndex = -1, context = null) {
     if (track && !track._errorRetryStage) track._errorRetryStage = 0;
     if (track && track.artist) track.artist = stripYoutubeTopic(track.artist);
@@ -9898,6 +9959,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           };
         });
         album._tracks = albumTrackItems;
+        scheduleBatchResolveIds(albumTrackItems);
         if (btnDownloadAlbum && album.type !== 'Daily Mix') btnDownloadAlbum.disabled = false;
         if (btnPlayAlbum && albumTrackItems.length > 0) btnPlayAlbum.disabled = false;
         albumTrackItems.forEach((trackItem, idx) => {
@@ -11491,30 +11553,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const artistEl = row.querySelector('.track-row-artist');
         if (artistEl) renderClickableArtists(artistEl, track.artist, track);
 
-        let prefetchTimer = null;
-        row.addEventListener('mouseenter', () => {
-          if (track.platform !== 'local' && !track._preloadedStreamUrl) {
-            prefetchTimer = setTimeout(() => {
-              const qFallback = encodeURIComponent(track.searchQuery || ((track.artist ? track.artist + ' - ' : '') + track.title));
-              const prefetchUrl = `${getApiBaseUrl()}/api/stream-info?id=${encodeURIComponent(track.resolvedId || track.id || '')}&url=${encodeURIComponent(track.url || '')}&platform=${encodeURIComponent(track.platform || state.platform || 'youtube')}&title=${encodeURIComponent(track.title || '')}&artist=${encodeURIComponent(track.artist || '')}&duration=${encodeURIComponent(track.duration || 0)}&q=${qFallback}`;
-              fetch(prefetchUrl)
-                .then(r => r.json())
-                .then(data => {
-                  if (data && data.success && data.streamUrl) {
-                    track._preloadedStreamUrl = data.streamUrl;
-                    if (data.resolvedId) track.resolvedId = data.resolvedId;
-                  }
-                })
-                .catch(() => {});
-            }, 100);
-          }
-        });
-        row.addEventListener('mouseleave', () => {
-          if (prefetchTimer) {
-            clearTimeout(prefetchTimer);
-            prefetchTimer = null;
-          }
-        });
+        attachTrackHoverPrefetch(row, track);
 
         row.addEventListener('click', (e) => {
           if (e.target.closest('.track-row-actions') || e.target.closest('.artist-link-part')) return;
@@ -11749,6 +11788,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     if (context !== 'local' && tracks && tracks.length > 0) {
+      scheduleBatchResolveIds(tracks);
       setTimeout(() => {
         tracks.slice(0, 2).forEach(t => {
           if (t && t.platform !== 'local' && !t._preloadedStreamUrl) {
@@ -24765,6 +24805,8 @@ function bindCoverHoldZoom(wrapEl) {
       }
     });
 
+    attachTrackHoverPrefetch(card, track);
+
     return card;
   }
 
@@ -25491,7 +25533,7 @@ function bindCoverHoldZoom(wrapEl) {
     return img;
   }
 
-  function spCard({ cover, gridCovers, title, sub, onClick, isExplicit = false }) {
+  function spCard({ cover, gridCovers, title, sub, onClick, isExplicit = false, track = null }) {
     const card = document.createElement('div');
     card.className = 'sp-card';
 
@@ -25536,6 +25578,9 @@ function bindCoverHoldZoom(wrapEl) {
 
     if (typeof onClick === 'function') {
       card.addEventListener('click', onClick);
+    }
+    if (track) {
+      attachTrackHoverPrefetch(card, track);
     }
     return card;
   }
@@ -25599,6 +25644,7 @@ function bindCoverHoldZoom(wrapEl) {
   function renderTrendingCards(row, tracks) {
     row.innerHTML = '';
     const filteredTracks = (tracks || []).filter(t => !isTrackBlocked(t) && !isArtistBlocked(t.artist));
+    scheduleBatchResolveIds(filteredTracks);
     filteredTracks.forEach((track, idx) => {
       const card = spCard({
         cover: (typeof getTrackThumbUrl === 'function' ? getTrackThumbUrl(track) : '') || track.thumbnail || track.cover || '',
@@ -25610,6 +25656,7 @@ function bindCoverHoldZoom(wrapEl) {
           playTrack(track, [...filteredTracks], idx);
         }
       });
+      attachTrackHoverPrefetch(card, track);
       row.appendChild(card);
     });
     bindHorizontalWheel(row);
@@ -25794,6 +25841,7 @@ function bindCoverHoldZoom(wrapEl) {
       generatedMixes.forEach((m, i) => {
         m.title = `Daily Mix ${i + 1}`;
         delete m.idx;
+        scheduleBatchResolveIds(m.tracks);
       });
     } catch (err) {
     } finally {
