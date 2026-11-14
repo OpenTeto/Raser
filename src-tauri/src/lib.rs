@@ -11,9 +11,19 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Shortcut, ShortcutState};
 
+fn set_webview_visibility(app: &tauri::AppHandle, visible: bool) {
+    let _ = app.emit("window-visibility", visible);
+    if let Some(w) = app.get_webview_window("main") {
+        let script = format!("window.__raserSetVisibility && window.__raserSetVisibility({});", visible);
+        let _ = w.eval(&script);
+    }
+}
+
 #[tauri::command]
 fn minimize_window(window: tauri::Window) {
+    set_webview_visibility(window.app_handle(), false);
     let _ = window.minimize();
+    trim_working_set();
 }
 
 #[tauri::command]
@@ -30,7 +40,9 @@ fn toggle_maximize_window(window: tauri::Window) {
 #[tauri::command]
 fn close_window(window: tauri::Window) {
     // Hide to system tray instead of closing process so playback continues
+    set_webview_visibility(window.app_handle(), false);
     let _ = window.hide();
+    trim_working_set();
 }
 
 #[tauri::command]
@@ -106,11 +118,88 @@ fn save_disk_storage(data: std::collections::HashMap<String, serde_json::Value>)
 fn trim_working_set() {
     #[cfg(target_os = "windows")]
     unsafe {
+        #[repr(C)]
+        struct PROCESSENTRY32W {
+            dw_size: u32,
+            cnt_usage: u32,
+            th32_process_id: u32,
+            th32_default_heap_id: usize,
+            th32_module_id: u32,
+            cnt_threads: u32,
+            th32_parent_process_id: u32,
+            pc_pri_class_base: i32,
+            dw_flags: u32,
+            sz_exe_file: [u16; 260],
+        }
+
         unsafe extern "system" {
             fn GetCurrentProcess() -> isize;
+            fn GetCurrentProcessId() -> u32;
             fn SetProcessWorkingSetSize(h_process: isize, min_size: usize, max_size: usize) -> i32;
+            fn CreateToolhelp32Snapshot(dw_flags: u32, th32_process_id: u32) -> isize;
+            fn Process32FirstW(h_snapshot: isize, lppe: *mut PROCESSENTRY32W) -> i32;
+            fn Process32NextW(h_snapshot: isize, lppe: *mut PROCESSENTRY32W) -> i32;
+            fn CloseHandle(h_object: isize) -> i32;
+            fn OpenProcess(dw_desired_access: u32, b_inherit_handle: i32, dw_process_id: u32) -> isize;
         }
+
+        // 1. Trim current Rust process (app.exe)
         let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+
+        // 2. Discover and trim all descendant processes (msedgewebview2.exe child & grandchild processes)
+        let my_pid = GetCurrentProcessId();
+        let snapshot = CreateToolhelp32Snapshot(0x00000002, 0); // TH32CS_SNAPPROCESS
+        if snapshot != -1 && snapshot != 0 {
+            let mut entry = PROCESSENTRY32W {
+                dw_size: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                cnt_usage: 0,
+                th32_process_id: 0,
+                th32_default_heap_id: 0,
+                th32_module_id: 0,
+                cnt_threads: 0,
+                th32_parent_process_id: 0,
+                pc_pri_class_base: 0,
+                dw_flags: 0,
+                sz_exe_file: [0u16; 260],
+            };
+
+            let mut all_processes = Vec::new();
+            if Process32FirstW(snapshot, &mut entry) != 0 {
+                loop {
+                    all_processes.push((entry.th32_process_id, entry.th32_parent_process_id));
+                    if Process32NextW(snapshot, &mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+            let _ = CloseHandle(snapshot);
+
+            let mut parent_pids = std::collections::HashSet::new();
+            parent_pids.insert(my_pid);
+            let mut pids_to_trim = Vec::new();
+
+            let mut added = true;
+            while added {
+                added = false;
+                for &(pid, ppid) in &all_processes {
+                    if parent_pids.contains(&ppid) && !parent_pids.contains(&pid) {
+                        parent_pids.insert(pid);
+                        pids_to_trim.push(pid);
+                        added = true;
+                    }
+                }
+            }
+
+            const PROCESS_SET_QUOTA: u32 = 0x0100;
+            const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
+            for pid in pids_to_trim {
+                let h_proc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_INFORMATION, 0, pid);
+                if h_proc != 0 {
+                    let _ = SetProcessWorkingSetSize(h_proc, usize::MAX, usize::MAX);
+                    let _ = CloseHandle(h_proc);
+                }
+            }
+        }
     }
 }
 
@@ -215,6 +304,7 @@ pub fn run() {
                                 let _ = w.show();
                                 let _ = w.unminimize();
                                 let _ = w.set_focus();
+                                let _ = w.eval("window.__raserSetVisibility && window.__raserSetVisibility(true);");
                             }
                         }
                         "toggle_play" => send_media_command(app, "toggle"),
@@ -236,11 +326,14 @@ pub fn run() {
                         let app = tray.app_handle();
                         if let Some(w) = app.get_webview_window("main") {
                             if w.is_visible().unwrap_or(false) {
+                                let _ = w.eval("window.__raserSetVisibility && window.__raserSetVisibility(false);");
                                 let _ = w.hide();
+                                trim_working_set();
                             } else {
                                 let _ = w.show();
                                 let _ = w.unminimize();
                                 let _ = w.set_focus();
+                                let _ = w.eval("window.__raserSetVisibility && window.__raserSetVisibility(true);");
                             }
                         }
                     }
@@ -257,20 +350,28 @@ pub fn run() {
                 let script = format!("window.__RASER_INITIAL_STORAGE__ = {};", initial_storage);
                 let _ = window.eval(&script);
                 let _ = window.show();
+
+                let w_clone = window.clone();
+                window.on_window_event(move |event| match event {
+                    tauri::WindowEvent::Resized(_) => {
+                        if let Ok(minimized) = w_clone.is_minimized() {
+                            if minimized {
+                                let _ = w_clone.eval("window.__raserSetVisibility && window.__raserSetVisibility(false);");
+                                trim_working_set();
+                            } else {
+                                let _ = w_clone.eval("window.__raserSetVisibility && window.__raserSetVisibility(true);");
+                            }
+                        }
+                    }
+                    _ => {}
+                });
             }
 
-            // Periodic working set memory trim to keep background RAM usage minimal (< 150MB)
+            // Periodic working set memory trim to keep background RAM usage minimal (< 90MB)
             std::thread::spawn(|| {
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(30));
-                    #[cfg(target_os = "windows")]
-                    unsafe {
-                        unsafe extern "system" {
-                            fn GetCurrentProcess() -> isize;
-                            fn SetProcessWorkingSetSize(h_process: isize, min_size: usize, max_size: usize) -> i32;
-                        }
-                        let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
-                    }
+                    trim_working_set();
                 }
             });
             Ok(())

@@ -134,19 +134,172 @@
     }
 
     _ensureGraphIfNeeded() {
-      // Direct Native Audio Mode: Web Audio graph bypass
+      if (!this.graphInitialized && this._attachedElement && this._hasActiveEffects()) {
+        this.init(this._attachedElement);
+      }
     }
 
     init(audioElement) {
       if (!audioElement) return;
+
       this._attachedElement = audioElement;
 
-      // Direct Native Audio Mode: Bypass Web Audio graph completely.
-      // Audio streams directly through Windows native WASAPI / Media Foundation!
-      this.graphInitialized = false;
-      this.applySettings(audioElement);
-      this._applyMasterVolume();
-      return;
+      const isMobileDevice = typeof window !== 'undefined' && (
+        window.innerWidth <= 840 ||
+        /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) ||
+        (document.documentElement && document.documentElement.classList.contains('is-mobile'))
+      );
+
+      // On mobile devices, bypass Web Audio graph when no DSP effects are active.
+      // This prevents 2.6ms buffer starvation (cızırtı / clicks), supports OS hardware decoding,
+      // and allows seamless background / lock screen playback without OS thread suspension (Muriel APK pattern).
+      if (isMobileDevice && !this._hasActiveEffects() && !this.graphInitialized) {
+        this.applySettings(audioElement);
+        this._applyMasterVolume();
+        return;
+      }
+
+      if (this.ctx) {
+        if (!audioElement.paused && this.ctx.state === 'suspended') {
+          this.ctx.resume().catch(() => {});
+        }
+      } else {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        this.ctx = new AC({ latencyHint: 'playback' });
+      }
+
+      if (this._attachedElement !== audioElement) {
+        this._attachedElement = audioElement;
+        audioElement.addEventListener('play', () => this.resumeAudioContext());
+        audioElement.addEventListener('pause', () => this.suspendAudioContextDebounced(5000));
+        audioElement.addEventListener('ended', () => this.suspendAudioContextDebounced(5000));
+      }
+
+      if (!this.graphInitialized) {
+        try {
+          this.mediaSource = this.ctx.createMediaElementSource(audioElement);
+
+          this.stdInput = this.ctx.createGain();
+          this.hqInput = this.ctx.createGain();
+
+          this.hqCompressor = this.ctx.createDynamicsCompressor();
+
+          this.hqBass = this.ctx.createBiquadFilter();
+          this.hqBass.type = 'lowshelf';
+          this.hqBass.frequency.value = 80;
+
+          this.hqVocal = this.ctx.createBiquadFilter();
+          this.hqVocal.type = 'peaking';
+          this.hqVocal.frequency.value = 2500;
+          this.hqVocal.Q.value = 1.2;
+
+          this.hqAir = this.ctx.createBiquadFilter();
+          this.hqAir.type = 'highshelf';
+          this.hqAir.frequency.value = 9000;
+
+          this.hqSaturation = this.ctx.createWaveShaper();
+          this.hqSaturation.oversample = '2x';
+
+          this.hqLimiter = this.ctx.createDynamicsCompressor();
+          this.hqLimiter.threshold.value = -1;
+          this.hqLimiter.knee.value = 0;
+          this.hqLimiter.ratio.value = 20;
+          this.hqLimiter.attack.value = 0.005;
+          this.hqLimiter.release.value = 0.05;
+
+          this.hqInput.connect(this.hqCompressor);
+          this.hqCompressor.connect(this.hqBass);
+          this.hqBass.connect(this.hqVocal);
+          this.hqVocal.connect(this.hqAir);
+          this.hqAir.connect(this.hqSaturation);
+          this.hqSaturation.connect(this.hqLimiter);
+
+          this.dryGain = this.ctx.createGain();
+          this.dryGain.gain.value = 1.0;
+
+          this.distortionNode = this.ctx.createWaveShaper();
+          this.distortionNode.oversample = 'none';
+          this.distortionNode.curve = this._makeDistortionCurve(0);
+          this.distortionGain = this.ctx.createGain();
+          this.distortionGain.gain.value = 0.0;
+
+          this.delayNode = this.ctx.createDelay(1.0);
+          this.delayNode.delayTime.value = 0.3;
+          this.delayFeedback = this.ctx.createGain();
+          this.delayFeedback.gain.value = 0.35;
+          this.delayGain = this.ctx.createGain();
+          this.delayGain.gain.value = 0.0;
+          this.delayNode.connect(this.delayFeedback);
+          this.delayFeedback.connect(this.delayNode);
+          this.delayNode.connect(this.delayGain);
+
+          this.convolverNode = this.ctx.createConvolver();
+          this.convolverNode.buffer = this._createReverbImpulse(this.ctx);
+          this.reverbGain = this.ctx.createGain();
+          this.reverbGain.gain.value = 0.0;
+
+          this.masterGain = this.ctx.createGain();
+          this.analyserNode = this.ctx.createAnalyser();
+          this.analyserNode.fftSize = 128;
+          this.analyserNode.smoothingTimeConstant = 0.8;
+
+          this.normGain = this.ctx.createGain();
+          this.normLimiter = this.ctx.createDynamicsCompressor();
+          this.normLimiter.threshold.value = -2;
+          this.normLimiter.knee.value = 0;
+          this.normLimiter.ratio.value = 20;
+          this.normLimiter.attack.value = 0.003;
+          this.normLimiter.release.value = 0.1;
+          this.levelAnalyser = this.ctx.createAnalyser();
+          this.levelAnalyser.fftSize = 2048;
+          this.levelBuf = new Float32Array(this.levelAnalyser.fftSize);
+
+          this.eqLow = this.ctx.createBiquadFilter();
+          this.eqLow.type = 'lowshelf';
+          this.eqLow.frequency.value = 200;
+          this.eqMid = this.ctx.createBiquadFilter();
+          this.eqMid.type = 'peaking';
+          this.eqMid.frequency.value = 1000;
+          this.eqMid.Q.value = 0.9;
+          this.eqHigh = this.ctx.createBiquadFilter();
+          this.eqHigh.type = 'highshelf';
+          this.eqHigh.frequency.value = 4000;
+          this.eqLow.connect(this.eqMid);
+          this.eqMid.connect(this.eqHigh);
+
+          const EQ_BAND_FREQS = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+          this.eqBands = EQ_BAND_FREQS.map(f => {
+            const node = this.ctx.createBiquadFilter();
+            node.type = 'peaking';
+            node.frequency.value = f;
+            node.Q.value = 1.1;
+            node.gain.value = 0;
+            return node;
+          });
+          this.eqHigh.connect(this.eqBands[0]);
+          for (let i = 0; i < this.eqBands.length - 1; i++) {
+            this.eqBands[i].connect(this.eqBands[i + 1]);
+          }
+
+          this.bus = this.ctx.createGain();
+          this.fadeGain = this.ctx.createGain();
+          this.fadeGain.gain.value = 1.0;
+          this.masterGain.connect(this.normGain);
+          this.normGain.connect(this.normLimiter);
+          this.normLimiter.connect(this.analyserNode);
+          this.analyserNode.connect(this.fadeGain);
+          this.fadeGain.connect(this.ctx.destination);
+          this.bus.connect(this.levelAnalyser);
+
+          this.graphInitialized = true;
+          this._updateRouting();
+        } catch (e) {
+          console.warn('[AudioEngine] Graph initialization notice:', e);
+        }
+      }
+
+      this.applySettings();
+      if (audioElement.paused) this.suspendAudioContextDebounced(5000);
     }
 
 
@@ -468,19 +621,7 @@
 
 
     getAnalyserNode() {
-      return this.analyserNode || { frequencyBinCount: 64 };
-    }
-
-    _fillSyntheticFrequencies(buffer) {
-      if (!buffer) return;
-      const now = Date.now() * 0.004;
-      const len = buffer.length;
-      for (let i = 0; i < len; i++) {
-        const wave = Math.sin(now + i * 0.35) * 0.5 + 0.5;
-        const wave2 = Math.cos(now * 1.3 + i * 0.2) * 0.3 + 0.3;
-        const decay = Math.max(0.2, 1 - (i / len));
-        buffer[i] = Math.round((wave * 0.6 + wave2 * 0.4) * decay * 190 + 30);
-      }
+      return this.analyserNode;
     }
 
     setAnalyserEnabled(enabled) {
@@ -514,8 +655,32 @@
       if (hidden) this.setAnalyserEnabled(false);
     }
 
+    _fillSyntheticFrequencies(buffer) {
+      if (!buffer) return;
+      const now = Date.now() * 0.004;
+      const len = buffer.length;
+      for (let i = 0; i < len; i++) {
+        const wave = Math.sin(now + i * 0.35) * 0.5 + 0.5;
+        const wave2 = Math.cos(now * 1.3 + i * 0.2) * 0.3 + 0.3;
+        const decay = Math.max(0.2, 1 - (i / len));
+        buffer[i] = Math.round((wave * 0.6 + wave2 * 0.4) * decay * 190 + 30);
+      }
+    }
+
     getFrequencyData(buffer) {
       if (!buffer) return;
+      if (this.analyserNode) {
+        if (!this._analyserConnected) this.setAnalyserEnabled(true);
+        this.analyserNode.getByteFrequencyData(buffer);
+        let hasData = false;
+        for (let i = 0; i < buffer.length; i++) {
+          if (buffer[i] > 0) {
+            hasData = true;
+            break;
+          }
+        }
+        if (hasData) return;
+      }
       if (this._attachedElement && !this._attachedElement.paused && (this._attachedElement.currentTime || 0) > 0) {
         this._fillSyntheticFrequencies(buffer);
       } else {
