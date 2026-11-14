@@ -25526,9 +25526,19 @@ function bindCoverHoldZoom(wrapEl) {
     artists.sort((a, b) => b.weight - a.weight);
     const topArtists = artists.slice(0, 28);
     topArtists.sort((a, b) => (b.weight * (0.65 + Math.random() * 0.7)) - (a.weight * (0.65 + Math.random() * 0.7)));
-    if (topArtists.length < 4) return [];
 
-    const bucketCount = Math.min(5, Math.floor(topArtists.length / 2));
+    let effectiveArtists = topArtists;
+    if (effectiveArtists.length < 4) {
+      const fallbackArtists = ['Pop Hits', 'Rock Classics', 'Hip Hop / Trap', 'Acoustic / Indie', 'Electronic / Dance'];
+      effectiveArtists = fallbackArtists.map(name => ({
+        norm: name.toLowerCase(),
+        name,
+        tracks: [{ title: name, artist: name, weight: 1 }],
+        weight: 1
+      }));
+    }
+
+    const bucketCount = Math.min(5, Math.max(2, Math.floor(effectiveArtists.length / 2)));
     const buckets = [];
     for (let i = 0; i < bucketCount; i++) {
       buckets.push({
@@ -25538,7 +25548,7 @@ function bindCoverHoldZoom(wrapEl) {
       });
     }
 
-    topArtists.forEach((art, rank) => {
+    effectiveArtists.forEach((art, rank) => {
       const b = buckets[rank % bucketCount];
       b.artists.push(art.name);
       b.seeds.push(...art.tracks);
@@ -25548,7 +25558,7 @@ function bindCoverHoldZoom(wrapEl) {
       if (b.seeds.length > 6) b.seeds = b.seeds.slice(0, 6);
     });
 
-    let validBuckets = buckets.filter(b => b.artists.length >= 2);
+    let validBuckets = buckets.filter(b => b.artists.length >= 1);
     if (validBuckets.length === 0 && buckets.length > 0) {
       validBuckets = [buckets[0]];
     }
@@ -25573,6 +25583,18 @@ function bindCoverHoldZoom(wrapEl) {
         const raw = localStorage.getItem(MIX_KEY);
         if (raw) cached = JSON.parse(raw);
       } catch (_) {}
+    }
+
+    // Invalidate stale generic/broken cache
+    if (cached && Array.isArray(cached.mixes) && cached.mixes.length > 0) {
+      const firstIds = cached.mixes.map(m => (m.tracks && m.tracks[0] && m.tracks[0].id) || '');
+      const isIdentical = firstIds.length > 1 && firstIds.every(id => id && id === firstIds[0]);
+      const hasGenericYt = cached.mixes.some(m => m.tracks && m.tracks.some(t => t.id === 'WBy8ETk_Fqs'));
+      if (isIdentical || hasGenericYt) {
+        cached = null;
+        try { localStorage.removeItem(MIX_KEY); } catch (_) {}
+        if (window.HomeCache) window.HomeCache.delete('daily_mixes');
+      }
     }
 
     if (!force && cached && cached.day === today && Array.isArray(cached.mixes) && cached.mixes.length > 0) {
@@ -25603,6 +25625,7 @@ function bindCoverHoldZoom(wrapEl) {
           limit: 20,
           clientProfile: profile,
           seeds: bucket.seeds,
+          artists: bucket.artists,
           avoid: typeof getWaveAvoid === 'function' ? getWaveAvoid() : []
         };
 
