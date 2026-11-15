@@ -15,6 +15,25 @@ use serde::{Deserialize, Serialize};
 const FFT_SAMPLE_COUNT: usize = 512;
 const FFT_BIN_COUNT: usize = 64;
 
+fn extract_track_id_from_url(url: &str) -> Option<String> {
+    if let Some(pos) = url.find('?') {
+        let query = &url[pos + 1..];
+        for pair in query.split('&') {
+            let mut parts = pair.splitn(2, '=');
+            if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+                if k == "id" || k == "trackId" || k == "v" {
+                    let decoded = urlencoding::decode(v).unwrap_or(std::borrow::Cow::Borrowed(v));
+                    let trimmed = decoded.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 // Lock-free wrapper around a rodio Source that downmixes channels to mono
 // and pushes real-time PCM samples into an rtrb lock-free ring buffer for FFT analysis
 pub struct VisualizerSource<S> {
@@ -293,9 +312,16 @@ impl AudioCore {
         }
 
         let this = Arc::clone(self);
+        let effective_tid = track_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .or_else(|| extract_track_id_from_url(&url));
+
         tauri::async_runtime::spawn_blocking(move || {
             let mut cached_bytes_opt = None;
-            if let Some(ref tid) = track_id {
+            if let Some(ref tid) = effective_tid {
                 if let Some(cached_path) = storage::get_cached_audio_path(tid) {
                     if let Ok(b) = std::fs::read(&cached_path) {
                         log::info!("AudioCore: Loaded track {} from disk cache {:?}", tid, cached_path);
@@ -393,7 +419,7 @@ impl AudioCore {
             let bytes_arc = Arc::new(bytes);
             *this.cached_bytes.lock().unwrap() = Some(Arc::clone(&bytes_arc));
 
-            if let Some(ref tid) = track_id {
+            if let Some(ref tid) = effective_tid {
                 let tid_clone = tid.clone();
                 let bytes_clone = Arc::clone(&bytes_arc);
                 std::thread::spawn(move || {
