@@ -375,7 +375,8 @@
     // Continuous sync loop with Rust audio core state
     let lastDispatchedPos = 0;
     setInterval(() => {
-      invoke('rust_audio_get_state').then(st => {
+      if (!document.hidden || _isPlaying) {
+        invoke('rust_audio_get_state').then(st => {
         if (!st) return;
         const wasPlaying = _isPlaying;
         _isPlaying = !!st.playing;
