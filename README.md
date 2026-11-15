@@ -24,7 +24,7 @@
 
 Traditional music players (Spotify, YouTube Music Desktop, Electron-based players) consume massive system resources even when idling in the background. **Raser was engineered from the ground up to solve this.**
 
-| Metric | Raser v1.1.3 (Rust Audio Core) | Electron / Spotify Player | Difference |
+| Metric | Raser v1.x.x (Rust Audio Core) | Electron / Spotify Player | Difference |
 | :--- | :---: | :---: | :---: |
 | **Idle RAM (Background / Tray)** | **~35 - 55 MB** | 450 - 750 MB | **~10x Lighter** |
 | **Active Playback RAM** | **~75 - 110 MB** | 600 - 950 MB | **~8x Lighter** |
@@ -62,12 +62,12 @@ Traditional music players (Spotify, YouTube Music Desktop, Electron-based player
 
 Head over to the **[Latest Release](https://github.com/tetoverse/Raser/releases/latest)** to download the installer:
 
-- **Standard Installer (Recommended):** `Raser_1.1.3_x64-setup.exe` (NSIS Installer)
-- **Enterprise / Windows Installer:** `Raser_1.1.3_x64_en-US.msi` (MSI Package)
+- **Standard Installer (Recommended):** [`Raser_1.x.x_x64-setup.exe`](https://github.com/tetoverse/Raser/releases/latest) (NSIS Installer)
+- **Enterprise / Windows Installer:** [`Raser_1.x.x_x64_en-US.msi`](https://github.com/tetoverse/Raser/releases/latest) (MSI Package)
 
 > **Silent Installation (CLI):**
 > ```cmd
-> Raser_1.1.3_x64-setup.exe /S
+> Raser_1.x.x_x64-setup.exe /S
 > ```
 
 ---
@@ -110,8 +110,8 @@ npx @tauri-apps/cli build
 ```
 
 The resulting executables and installers will be generated under:
-`src-tauri/target/release/bundle/nsis/Raser_1.1.3_x64-setup.exe`
-`src-tauri/target/release/bundle/msi/Raser_1.1.3_x64_en-US.msi`
+`src-tauri/target/release/bundle/nsis/Raser_1.x.x_x64-setup.exe`
+`src-tauri/target/release/bundle/msi/Raser_1.x.x_x64_en-US.msi`
 
 ---
 
