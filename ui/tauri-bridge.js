@@ -119,8 +119,286 @@
     },
     setThumbarButtons: () => {},
     getCacheSize: async () => 0,
-    clearCache: async () => {}
+    clearCache: async () => {},
+
+    // Rust Audio Core APIs
+    rustAudioLoad: (url, startPos, duration, autoplay) => invoke('rust_audio_load', { url, startPos, duration, autoplay }),
+    rustAudioPlay: () => invoke('rust_audio_play'),
+    rustAudioPause: () => invoke('rust_audio_pause'),
+    rustAudioToggle: () => invoke('rust_audio_toggle'),
+    rustAudioSeek: (position) => invoke('rust_audio_seek', { position }),
+    rustAudioSetVolume: (volume) => invoke('rust_audio_set_volume', { volume }),
+    rustAudioSetSpeed: (speed) => invoke('rust_audio_set_speed', { speed }),
+    rustAudioGetState: () => invoke('rust_audio_get_state'),
+    rustAudioGetFrequencyData: () => cachedRustFreqData
   });
+
+  // --- Rust Audio Core Hook for HTML5 native-audio ---
+  let _isPlaying = false;
+  let _currentPosition = 0;
+  let _currentDuration = 0;
+  let _volume = 0.85;
+  let _speed = 1.0;
+  let _muted = false;
+  let _currentSrc = '';
+  let _isLoading = false;
+  let _hasEnded = false;
+  let currentLoadToken = 0;
+  let cachedRustFreqData = new Uint8Array(64);
+  let isFetchingFreq = false;
+
+  const hookNativeAudioElement = (audio) => {
+    if (!audio || audio.__rustAudioHooked) return;
+    audio.__rustAudioHooked = true;
+    window.__rustAudioActive = true;
+
+    try {
+      audio.removeAttribute('src');
+      audio.src = '';
+    } catch (_) {}
+
+    const notifyTrackEnded = () => {
+      if (_hasEnded) return;
+      _hasEnded = true;
+      _isPlaying = false;
+      cachedRustFreqData.fill(0);
+      audio.dispatchEvent(new Event('pause'));
+      audio.dispatchEvent(new Event('ended'));
+      invoke('taskbar_playback_state', { playing: false }).catch(() => {});
+    };
+    window.__raserAudioEnded = notifyTrackEnded;
+
+    if (window.__TAURI__ && window.__TAURI__.event && typeof window.__TAURI__.event.listen === 'function') {
+      window.__TAURI__.event.listen('rust-audio-ended', () => {
+        notifyTrackEnded();
+      });
+    }
+
+    Object.defineProperty(audio, 'src', {
+      configurable: true,
+      enumerable: true,
+      get: () => _currentSrc,
+      set: (url) => {
+        const loadToken = ++currentLoadToken;
+        _currentSrc = url || '';
+        if (!_currentSrc) {
+          _isPlaying = false;
+          _hasEnded = false;
+          _isLoading = false;
+          invoke('rust_audio_pause').catch(() => {});
+          return;
+        }
+        _isLoading = true;
+        _hasEnded = false;
+        audio.dispatchEvent(new Event('loadstart'));
+
+        let streamUrl = _currentSrc;
+        if (streamUrl.startsWith('file:///')) {
+          try {
+            streamUrl = decodeURIComponent(streamUrl.slice(8)).replace(/\//g, '\\');
+          } catch (_) {
+            streamUrl = streamUrl.slice(8).replace(/\//g, '\\');
+          }
+        } else if (streamUrl.startsWith('http://asset.localhost/') || streamUrl.startsWith('https://asset.localhost/')) {
+          try {
+            const pathPart = decodeURIComponent(streamUrl.replace(/^https?:\/\/asset\.localhost\//, ''));
+            streamUrl = pathPart.replace(/^\\\\\?\\/, '');
+          } catch (_) {}
+        }
+
+        let durHint = null;
+        try {
+          if (typeof state !== 'undefined' && state.currentTrack && Number.isFinite(state.currentTrack.duration) && state.currentTrack.duration > 0) {
+            durHint = state.currentTrack.duration;
+          }
+        } catch (_) {}
+
+        invoke('rust_audio_load', {
+          url: streamUrl,
+          startPos: 0,
+          duration: durHint,
+          autoplay: _isPlaying
+        }).then((st) => {
+          if (loadToken !== currentLoadToken) return;
+          _isLoading = false;
+          if (st && typeof st.duration === 'number' && st.duration > 0) {
+            _currentDuration = st.duration;
+          } else if (durHint && durHint > 0) {
+            _currentDuration = durHint;
+          }
+          audio.dispatchEvent(new Event('loadedmetadata'));
+          audio.dispatchEvent(new Event('durationchange'));
+          audio.dispatchEvent(new Event('canplay'));
+          audio.dispatchEvent(new Event('canplaythrough'));
+        }).catch((err) => {
+          if (loadToken !== currentLoadToken) return;
+          console.warn('[RustAudioCore] load error:', err);
+          _isLoading = false;
+          audio.dispatchEvent(new Event('error'));
+        });
+      }
+    });
+
+    Object.defineProperty(audio, 'currentTime', {
+      configurable: true,
+      enumerable: true,
+      get: () => _currentPosition,
+      set: (val) => {
+        const target = Math.max(0, Number(val) || 0);
+        _currentPosition = target;
+        _hasEnded = false;
+        invoke('rust_audio_seek', { position: target }).catch(() => {});
+        audio.dispatchEvent(new Event('seeked'));
+        audio.dispatchEvent(new Event('timeupdate'));
+      }
+    });
+
+    Object.defineProperty(audio, 'duration', {
+      configurable: true,
+      enumerable: true,
+      get: () => (_currentDuration > 0 ? _currentDuration : NaN)
+    });
+
+    Object.defineProperty(audio, 'paused', {
+      configurable: true,
+      enumerable: true,
+      get: () => !_isPlaying
+    });
+
+    Object.defineProperty(audio, 'volume', {
+      configurable: true,
+      enumerable: true,
+      get: () => _volume,
+      set: (val) => {
+        _volume = Math.max(0, Math.min(1, Number(val) || 0));
+        invoke('rust_audio_set_volume', { volume: _muted ? 0 : _volume }).catch(() => {});
+        audio.dispatchEvent(new Event('volumechange'));
+      }
+    });
+
+    Object.defineProperty(audio, 'muted', {
+      configurable: true,
+      enumerable: true,
+      get: () => _muted,
+      set: (val) => {
+        _muted = !!val;
+        invoke('rust_audio_set_volume', { volume: _muted ? 0 : _volume }).catch(() => {});
+        audio.dispatchEvent(new Event('volumechange'));
+      }
+    });
+
+    Object.defineProperty(audio, 'playbackRate', {
+      configurable: true,
+      enumerable: true,
+      get: () => _speed,
+      set: (val) => {
+        _speed = Math.max(0.25, Math.min(4, Number(val) || 1));
+        invoke('rust_audio_set_speed', { speed: _speed }).catch(() => {});
+      }
+    });
+
+    Object.defineProperty(audio, 'readyState', {
+      configurable: true,
+      enumerable: true,
+      get: () => (_isLoading ? 1 : 4)
+    });
+
+    Object.defineProperty(audio, 'seeking', {
+      configurable: true,
+      enumerable: true,
+      get: () => false
+    });
+
+    Object.defineProperty(audio, 'ended', {
+      configurable: true,
+      enumerable: true,
+      get: () => _hasEnded
+    });
+
+    audio.play = () => {
+      _isPlaying = true;
+      _hasEnded = false;
+      audio.dispatchEvent(new Event('play'));
+      audio.dispatchEvent(new Event('playing'));
+      invoke('taskbar_playback_state', { playing: true }).catch(() => {});
+      return invoke('rust_audio_play').then(() => {}).catch(e => {
+        _isPlaying = false;
+        throw e;
+      });
+    };
+
+    audio.pause = () => {
+      _isPlaying = false;
+      cachedRustFreqData.fill(0);
+      audio.dispatchEvent(new Event('pause'));
+      invoke('taskbar_playback_state', { playing: false }).catch(() => {});
+      return invoke('rust_audio_pause').catch(() => {});
+    };
+
+    audio.load = () => {};
+
+    // Continuous sync loop with Rust audio core state
+    let lastDispatchedPos = 0;
+    setInterval(() => {
+      invoke('rust_audio_get_state').then(st => {
+        if (!st) return;
+        const wasPlaying = _isPlaying;
+        _isPlaying = !!st.playing;
+        _currentPosition = typeof st.position === 'number' ? st.position : 0;
+        
+        if (typeof st.duration === 'number' && st.duration > 0 && st.duration !== _currentDuration) {
+          _currentDuration = st.duration;
+          audio.dispatchEvent(new Event('durationchange'));
+        }
+
+        if (st.ended && !_hasEnded) {
+          notifyTrackEnded();
+        } else if (!st.ended && _hasEnded) {
+          _hasEnded = false;
+        }
+
+        if (_isPlaying && Math.abs(_currentPosition - lastDispatchedPos) >= 0.05) {
+          lastDispatchedPos = _currentPosition;
+          audio.dispatchEvent(new Event('timeupdate'));
+        }
+
+        if (!wasPlaying && _isPlaying) {
+          audio.dispatchEvent(new Event('play'));
+          audio.dispatchEvent(new Event('playing'));
+          invoke('taskbar_playback_state', { playing: true }).catch(() => {});
+        } else if (wasPlaying && !_isPlaying && !st.ended) {
+          audio.dispatchEvent(new Event('pause'));
+          invoke('taskbar_playback_state', { playing: false }).catch(() => {});
+        }
+      }).catch(() => {});
+    }, 45);
+
+    // Fast polling loop for FFT frequency data (~30 FPS)
+    setInterval(() => {
+      if (_isPlaying && !document.hidden && !isFetchingFreq) {
+        isFetchingFreq = true;
+        invoke('rust_audio_get_frequency_data').then(data => {
+          if (data && data.length) {
+            cachedRustFreqData = new Uint8Array(data);
+          }
+        }).catch(() => {}).finally(() => {
+          isFetchingFreq = false;
+        });
+      } else if (!_isPlaying && cachedRustFreqData.some(v => v > 0)) {
+        for (let i = 0; i < cachedRustFreqData.length; i++) {
+          cachedRustFreqData[i] = Math.floor(cachedRustFreqData[i] * 0.7);
+        }
+      }
+    }, 33);
+  };
+
+  const tryHookNativeAudio = () => {
+    const el = document.getElementById('native-audio') || document.querySelector('audio');
+    if (el) hookNativeAudioElement(el);
+  };
+  tryHookNativeAudio();
+  document.addEventListener('DOMContentLoaded', tryHookNativeAudio);
+  setTimeout(tryHookNativeAudio, 250);
 
   // Restore playlists, favorites, and history from disk storage into active runtime
   const applyDiskStorage = (data) => {

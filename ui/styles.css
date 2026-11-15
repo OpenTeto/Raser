@@ -7565,7 +7565,7 @@ body.mini.mini-lyrics-on #btn-mini-lyrics {
 #view-favorites,
 .favorites-view {
   box-sizing: border-box !important;
-  overflow-x: hidden;
+  overflow: visible !important;
 }
 
 .keycap { position: relative; isolation: isolate; display: inline-flex; align-items: center; justify-content: center; min-width: 40px; height: 40px; padding: 0 12px 4px; box-sizing: border-box; border-radius: 9px; background: color-mix(in srgb, var(--md-sys-color-on-surface) 6%, var(--md-sys-color-surface-container-lowest)); color: var(--md-sys-color-on-surface); font: 600 13px/1 var(--font-family, inherit); letter-spacing: .02em; user-select: none; }
@@ -11274,7 +11274,7 @@ body.perf .np-queue-panel { transition: none; }
 .user-account-container {
   display: flex;
   align-items: center;
-  margin-left: 8px;
+  margin-left: auto;
 }
 
 .btn-account-pill {
@@ -11335,6 +11335,7 @@ body.perf .np-queue-panel { transition: none; }
 }
 
 .cloud-sync-dot {
+  display: none !important;
   width: 8px;
   height: 8px;
   border-radius: 50%;

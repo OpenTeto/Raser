@@ -1,15 +1,68 @@
+mod audio_core;
 mod discord;
 mod local_files;
 mod storage;
 mod taskbar;
 mod updater;
 
+use std::sync::Arc;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager,
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Shortcut, ShortcutState};
+
+#[tauri::command]
+async fn rust_audio_load(
+    audio_core: tauri::State<'_, Arc<audio_core::AudioCore>>,
+    url: String,
+    start_pos: Option<f64>,
+    duration: Option<f64>,
+    autoplay: Option<bool>,
+) -> Result<audio_core::AudioState, String> {
+    audio_core.load_audio_async(url, start_pos, duration, autoplay.unwrap_or(true)).await
+}
+
+#[tauri::command]
+fn rust_audio_play(audio_core: tauri::State<Arc<audio_core::AudioCore>>) -> Result<(), String> {
+    audio_core.play()
+}
+
+#[tauri::command]
+fn rust_audio_pause(audio_core: tauri::State<Arc<audio_core::AudioCore>>) -> Result<(), String> {
+    audio_core.pause()
+}
+
+#[tauri::command]
+fn rust_audio_toggle(audio_core: tauri::State<Arc<audio_core::AudioCore>>) -> Result<bool, String> {
+    audio_core.toggle()
+}
+
+#[tauri::command]
+fn rust_audio_seek(audio_core: tauri::State<Arc<audio_core::AudioCore>>, position: f64) -> Result<(), String> {
+    audio_core.seek(position)
+}
+
+#[tauri::command]
+fn rust_audio_set_volume(audio_core: tauri::State<Arc<audio_core::AudioCore>>, volume: f32) -> Result<(), String> {
+    audio_core.set_volume(volume)
+}
+
+#[tauri::command]
+fn rust_audio_set_speed(audio_core: tauri::State<Arc<audio_core::AudioCore>>, speed: f32) -> Result<(), String> {
+    audio_core.set_speed(speed)
+}
+
+#[tauri::command]
+fn rust_audio_get_state(audio_core: tauri::State<Arc<audio_core::AudioCore>>) -> audio_core::AudioState {
+    audio_core.get_state()
+}
+
+#[tauri::command]
+fn rust_audio_get_frequency_data(audio_core: tauri::State<Arc<audio_core::AudioCore>>) -> Vec<u8> {
+    audio_core.get_frequency_data()
+}
 
 fn set_webview_visibility(app: &tauri::AppHandle, visible: bool) {
     let _ = app.emit("window-visibility", visible);
@@ -116,6 +169,14 @@ fn save_disk_storage(data: std::collections::HashMap<String, serde_json::Value>)
 
 #[tauri::command]
 fn trim_working_set() {
+    do_trim_working_set();
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        do_trim_working_set();
+    });
+}
+
+fn do_trim_working_set() {
     #[cfg(target_os = "windows")]
     unsafe {
         #[repr(C)]
@@ -231,17 +292,29 @@ fn send_media_command(app: &tauri::AppHandle, cmd: &str) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let audio_core = Arc::new(audio_core::AudioCore::new());
+    let audio_core_global = Arc::clone(&audio_core);
+    let audio_core_tray = Arc::clone(&audio_core);
+    let audio_core_monitor = Arc::clone(&audio_core);
+
     tauri::Builder::default()
+        .manage(Arc::clone(&audio_core))
         .plugin(tauri_plugin_log::Builder::default().build())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, shortcut, event| {
+                .with_handler(move |app, shortcut, event| {
                     if event.state() == ShortcutState::Pressed {
                         match shortcut.key {
-                            Code::MediaPlayPause => send_media_command(app, "toggle"),
+                            Code::MediaPlayPause => {
+                                let _ = audio_core_global.toggle();
+                                send_media_command(app, "toggle");
+                            }
                             Code::MediaTrackNext => send_media_command(app, "next"),
                             Code::MediaTrackPrevious => send_media_command(app, "prev"),
-                            Code::MediaStop => send_media_command(app, "stop"),
+                            Code::MediaStop => {
+                                let _ = audio_core_global.pause();
+                                send_media_command(app, "stop");
+                            }
                             _ => {}
                         }
                     }
@@ -263,9 +336,18 @@ pub fn run() {
             taskbar_playback_state,
             get_disk_storage,
             save_disk_storage,
-            trim_working_set
+            trim_working_set,
+            rust_audio_load,
+            rust_audio_play,
+            rust_audio_pause,
+            rust_audio_toggle,
+            rust_audio_seek,
+            rust_audio_set_volume,
+            rust_audio_set_speed,
+            rust_audio_get_state,
+            rust_audio_get_frequency_data
         ])
-        .setup(|app| {
+        .setup(move |app| {
             let _ = app.global_shortcut().register(Shortcut::new(None, Code::MediaPlayPause));
             let _ = app.global_shortcut().register(Shortcut::new(None, Code::MediaTrackNext));
             let _ = app.global_shortcut().register(Shortcut::new(None, Code::MediaTrackPrevious));
@@ -297,7 +379,7 @@ pub fn run() {
             let mut tray_builder = TrayIconBuilder::new()
                 .menu(&tray_menu)
                 .tooltip("Raser")
-                .on_menu_event(|app, event| {
+                .on_menu_event(move |app, event| {
                     match event.id.as_ref() {
                         "show" => {
                             if let Some(w) = app.get_webview_window("main") {
@@ -307,7 +389,10 @@ pub fn run() {
                                 let _ = w.eval("window.__raserSetVisibility && window.__raserSetVisibility(true);");
                             }
                         }
-                        "toggle_play" => send_media_command(app, "toggle"),
+                        "toggle_play" => {
+                            let _ = audio_core_tray.toggle();
+                            send_media_command(app, "toggle");
+                        }
                         "next_track" => send_media_command(app, "next"),
                         "prev_track" => send_media_command(app, "prev"),
                         "quit" => {
@@ -366,6 +451,32 @@ pub fn run() {
                     _ => {}
                 });
             }
+
+            // Continuous background audio monitor: sync taskbar thumbnail play/pause and notify on track end
+            let app_handle_audio = app.handle().clone();
+            let is_tr = is_tr_locale();
+            std::thread::spawn(move || {
+                let mut last_playing = false;
+                let mut last_ended = false;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    let state = audio_core_monitor.get_state();
+                    if state.playing != last_playing {
+                        last_playing = state.playing;
+                        taskbar::win::update_playback_state(state.playing, is_tr);
+                    }
+                    if state.ended && !last_ended {
+                        last_ended = true;
+                        taskbar::win::update_playback_state(false, is_tr);
+                        let _ = app_handle_audio.emit("rust-audio-ended", ());
+                        if let Some(w) = app_handle_audio.get_webview_window("main") {
+                            let _ = w.eval("window.__raserAudioEnded && window.__raserAudioEnded();");
+                        }
+                    } else if !state.ended {
+                        last_ended = false;
+                    }
+                }
+            });
 
             // Periodic working set memory trim to keep background RAM usage minimal (< 90MB)
             std::thread::spawn(|| {

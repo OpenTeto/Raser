@@ -3211,6 +3211,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     let bufferLength = analyserNode ? analyserNode.frequencyBinCount : 0;
     let freqData = bufferLength > 0 ? new Uint8Array(bufferLength) : null;
+    let lastRenderTime = 0;
 
     function renderLoop(timestamp) {
       if (document.hidden || !state.isWindowVisible) {
@@ -3231,6 +3232,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
 
       animationFrameId = requestAnimationFrame(renderLoop);
+
+      // Smooth 30-35 FPS lock to halve GPU compositor & backing store load without visual difference
+      if (timestamp - lastRenderTime < 28) return;
+      lastRenderTime = timestamp;
 
       try {
         const activeTrim = state.currentTrack ? getTrackTrim(state.currentTrack) : null;
@@ -3836,6 +3841,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       document.body.classList.add('hidden-window');
       if (typeof updateCoverAnimVisibility === 'function') updateCoverAnimVisibility();
       window.electronAPI?.clearWebFrameCache?.();
+      try {
+        if (typeof coverAnalysisCache !== 'undefined' && coverAnalysisCache.size > 15) coverAnalysisCache.clear();
+        if (typeof dominantColorsCache !== 'undefined' && dominantColorsCache.size > 15) dominantColorsCache.clear();
+        if (typeof waveformPeakCache !== 'undefined' && waveformPeakCache.size > 10) waveformPeakCache.clear();
+        if (typeof tvkBakedCoverCache !== 'undefined' && tvkBakedCoverCache.size > 10) tvkBakedCoverCache.clear();
+      } catch (e) {}
+      if (typeof window.gc === 'function') {
+        try { window.gc(); } catch (e) {}
+      }
       if (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) {
         window.__TAURI__.core.invoke('trim_working_set').catch(() => {});
       }
@@ -3843,12 +3857,22 @@ document.addEventListener('DOMContentLoaded', async () => {
       document.body.classList.remove('app-paused');
       document.body.classList.remove('hidden-window');
       if (typeof updateCoverAnimVisibility === 'function') updateCoverAnimVisibility();
+      if (typeof applyVisualEffects === 'function') applyVisualEffects();
       resizeCanvases();
       hasDrawnPausedFrame = false;
       if (state.isPlaying || isDraggingScrubber) startVisualizers();
       if (typeof cacheModal !== 'undefined' && cacheModal && cacheModal.classList.contains('visible') && typeof cacheRafId !== 'undefined' && !cacheRafId) {
         cacheRafId = requestAnimationFrame(cacheFrame);
       }
+      // Ensure cover animations immediately resume after window restore animation
+      requestAnimationFrame(() => {
+        if (typeof updateCoverAnimVisibility === 'function') updateCoverAnimVisibility();
+        if (typeof m3cStart === 'function') m3cStart();
+      });
+      setTimeout(() => {
+        if (typeof updateCoverAnimVisibility === 'function') updateCoverAnimVisibility();
+        if (typeof m3cStart === 'function') m3cStart();
+      }, 120);
       if (typeof updateLyricsPadding === 'function') {
         const syncOnRestore = () => {
           updateLyricsPadding();
@@ -4532,10 +4556,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  // --- HYBRID FAST IN-MEMORY AUDIO BLOB CACHE ---
-  const trackBlobMemoryCache = new Map(); // canonicalId -> { blob, blobUrl, size, lastAccessed }
-  const MAX_BLOB_CACHE_ENTRIES = 12;
-  const inflightBlobDownloads = new Map(); // canonicalId -> Promise<entry>
+  // --- STREAMING AUDIO ARCHITECTURE (Zero Blob RAM Bloat) ---
+  const trackBlobMemoryCache = new Map(); // Kept for API compatibility, strictly disabled
+  const MAX_BLOB_CACHE_ENTRIES = 0;
+  const inflightBlobDownloads = new Map();
 
   function freeBlobCacheEntry(key) {
     const entry = trackBlobMemoryCache.get(key);
@@ -4548,64 +4572,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function evictOldestBlobIfNeeded() {
-    if (trackBlobMemoryCache.size < MAX_BLOB_CACHE_ENTRIES) return;
-    const currentId = state.currentTrack ? getTrackCanonicalId(state.currentTrack) : null;
-    let oldestKey = null;
-    let oldestTime = Infinity;
-    for (const [key, item] of trackBlobMemoryCache.entries()) {
-      if (key !== currentId && item.lastAccessed < oldestTime) {
-        oldestTime = item.lastAccessed;
-        oldestKey = key;
-      }
+    for (const [key] of trackBlobMemoryCache.entries()) {
+      freeBlobCacheEntry(key);
     }
-    if (oldestKey) freeBlobCacheEntry(oldestKey);
   }
 
   async function bufferTrackToBlob(track, streamUrl, signal = null) {
-    if (!track || !streamUrl || streamUrl.includes('.m3u8') || track.platform === 'local') return null;
-    const cid = getTrackCanonicalId(track);
-    if (!cid) return null;
-
-    if (trackBlobMemoryCache.has(cid)) {
-      const entry = trackBlobMemoryCache.get(cid);
-      entry.lastAccessed = Date.now();
-      return entry;
-    }
-
-    if (inflightBlobDownloads.has(cid)) {
-      return inflightBlobDownloads.get(cid);
-    }
-
-    const downloadPromise = (async () => {
-      try {
-        const fullUrl = streamUrl.startsWith('http') ? streamUrl : `${getApiBaseUrl()}${streamUrl}`;
-        const res = await fetch(fullUrl, {
-          signal: signal || undefined,
-          headers: { 'Accept': 'audio/*, */*' }
-        });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const blob = await res.blob();
-        if (!blob || blob.size < 1.5 * 1024 * 1024) throw new Error('Blob empty or partial burst');
-
-        evictOldestBlobIfNeeded();
-        const blobUrl = URL.createObjectURL(blob);
-        const entry = {
-          blob,
-          blobUrl,
-          size: blob.size,
-          lastAccessed: Date.now()
-        };
-        trackBlobMemoryCache.set(cid, entry);
-        return entry;
-      } catch (err) {
-        return null;
-      } finally {
-        inflightBlobDownloads.delete(cid);
-      }
-    })();
-
-    inflightBlobDownloads.set(cid, downloadPromise);
-    return downloadPromise;
+    // Pure streaming mode: do not store multi-megabyte audio files in JS heap
+    return null;
   }
 
   function safeSeekTo(targetTime) {
@@ -4921,7 +4895,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           hlsInstance = null;
         }
         el.nativeAudio.preload = 'auto';
-        if (track._preloadedStreamUrl.includes('.m3u8') && window.Hls && Hls.isSupported()) {
+        if (track._preloadedStreamUrl.includes('.m3u8') && window.Hls && Hls.isSupported() && !(window.electronAPI && window.electronAPI.isTauri)) {
           hlsInstance = new Hls({ enableWorker: true, lowLatencyMode: true, maxBufferLength: 30, maxMaxBufferLength: 60, maxBufferSize: 30 * 1000 * 1000 });
           hlsInstance.on(Hls.Events.ERROR, (_, errData) => {
             if (errData && errData.fatal) {
@@ -4991,21 +4965,29 @@ document.addEventListener('DOMContentLoaded', async () => {
         track._preloadedStreamUrl = data.streamUrl;
 
         el.nativeAudio.preload = 'auto';
-        if ((data.isHls || data.streamUrl.includes('.m3u8')) && window.Hls && Hls.isSupported()) {
-          hlsInstance = new Hls({ enableWorker: true, lowLatencyMode: true, maxBufferLength: 30, maxMaxBufferLength: 60, maxBufferSize: 30 * 1000 * 1000 });
-          hlsInstance.on(Hls.Events.ERROR, (_, errData) => {
-            if (errData && errData.fatal) {
-              if (errData.type === Hls.ErrorTypes.NETWORK_ERROR) hlsInstance.startLoad();
-              else if (errData.type === Hls.ErrorTypes.MEDIA_ERROR) hlsInstance.recoverMediaError();
-            }
-          });
-          hlsInstance.loadSource(data.streamUrl);
-          hlsInstance.attachMedia(el.nativeAudio);
-          hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
-            if (currentToken === state.loadToken) {
-              playSmooth();
-            }
-          });
+        if (data.isHls || data.streamUrl.includes('.m3u8')) {
+          if (window.electronAPI && window.electronAPI.isTauri) {
+            el.nativeAudio.src = `${getApiBaseUrl()}/api/stream?url=${encodeURIComponent(track.url || data.streamUrl)}&platform=${encodeURIComponent(track.platform || 'soundcloud')}&id=${encodeURIComponent(track.id || '')}`;
+            playSmooth();
+          } else if (window.Hls && Hls.isSupported()) {
+            hlsInstance = new Hls({ enableWorker: true, lowLatencyMode: true, maxBufferLength: 30, maxMaxBufferLength: 60, maxBufferSize: 30 * 1000 * 1000 });
+            hlsInstance.on(Hls.Events.ERROR, (_, errData) => {
+              if (errData && errData.fatal) {
+                if (errData.type === Hls.ErrorTypes.NETWORK_ERROR) hlsInstance.startLoad();
+                else if (errData.type === Hls.ErrorTypes.MEDIA_ERROR) hlsInstance.recoverMediaError();
+              }
+            });
+            hlsInstance.loadSource(data.streamUrl);
+            hlsInstance.attachMedia(el.nativeAudio);
+            hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+              if (currentToken === state.loadToken) {
+                playSmooth();
+              }
+            });
+          } else {
+            el.nativeAudio.src = data.streamUrl;
+            playSmooth();
+          }
         } else {
           el.nativeAudio.src = data.streamUrl;
           playSmooth();
@@ -5053,7 +5035,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             // Only attach HLS if the native audio stream is NOT already playing smoothly!
             const isPlayingHealthy = el.nativeAudio && !el.nativeAudio.paused && !el.nativeAudio.error && el.nativeAudio.currentTime > 0.1;
-            if (!isPlayingHealthy && data.isHls && window.Hls && Hls.isSupported()) {
+            if (!isPlayingHealthy && data.isHls && window.Hls && Hls.isSupported() && !(window.electronAPI && window.electronAPI.isTauri)) {
               if (hlsInstance) {
                 try { hlsInstance.destroy(); } catch (_) {}
                 hlsInstance = null;
@@ -11597,7 +11579,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       ${!isAlbum ? `
       <div class="track-row-thumb-wrap">
         <svg class="track-row-fallback-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="16" r="3"></circle></svg>
-        ${rowThumb ? `<img class="track-row-thumb" src="${escapeHtml(rowThumb)}" alt="" onerror="this.style.display='none'">` : ''}
+        ${rowThumb ? `<img class="track-row-thumb" src="${escapeHtml(rowThumb)}" alt="" loading="lazy" decoding="async" onerror="this.style.display='none'">` : ''}
       </div>` : ''}
       <div class="track-row-info">
       <span class="track-row-title">${(context === 'favorites' || context === 'playlist') && isTrackPinned(track) ? '<svg class="track-pin-mark" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 3h6l-1 7 3 3v2H7v-2l3-3-1-7z"/></svg>' : ''}${escapeHtml(track.title || 'untitled')}</span>
@@ -11957,8 +11939,9 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
       
       const zoom = parseFloat(document.body.style.zoom) || 1;
-      const visibleTop = Math.max(0, scrollParent.scrollTop - relativeTop);
       const clientHeight = (scrollParent && scrollParent.clientHeight > 0) ? scrollParent.clientHeight : ((window.innerHeight || 800) / zoom);
+      const maxVisibleTop = Math.max(0, totalListHeight - clientHeight);
+      const visibleTop = Math.min(Math.max(0, scrollParent.scrollTop - relativeTop), maxVisibleTop);
 
       let startIndex = Math.floor(visibleTop / itemHeight) - overscan;
       let endIndex = Math.ceil((visibleTop + clientHeight) / itemHeight) + overscan;
@@ -11991,6 +11974,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       const padBottom = Math.max(0, currentList.length - endIndex) * itemHeight;
       container.style.paddingTop = `${padTop}px`;
       container.style.paddingBottom = `${padBottom}px`;
+      if (container.children && container.children.length > 0) {
+        for (let i = 0; i < container.children.length; i++) {
+          const oldChild = container.children[i];
+          if (oldChild && oldChild._trackData) oldChild._trackData = null;
+        }
+      }
       if (typeof container.replaceChildren === 'function') {
         container.replaceChildren(fragment);
       } else {
@@ -17565,14 +17554,16 @@ function bindCoverHoldZoom(wrapEl) {
 
   function updateCoverAnimVisibility() {
     const isHidden = document.hidden || document.body.classList.contains('hidden-window');
-    const playbar = el.playbar || document.getElementById('playbar');
-    const isBarHidden = playbar && playbar.offsetParent === null;
-    if (isHidden || isBarHidden) {
+    if (isHidden) {
       if (m3c && m3c.raf) {
         cancelAnimationFrame(m3c.raf);
         m3c.raf = 0;
       }
     } else if (typeof m3cEnabled === 'function' && m3cEnabled()) {
+      if (m3c) {
+        m3c.last = performance.now();
+        m3cDraw(m3c.last);
+      }
       m3cStart();
     }
   }
