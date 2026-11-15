@@ -20,8 +20,41 @@ async fn rust_audio_load(
     start_pos: Option<f64>,
     duration: Option<f64>,
     autoplay: Option<bool>,
+    track_id: Option<String>,
 ) -> Result<audio_core::AudioState, String> {
-    audio_core.load_audio_async(url, start_pos, duration, autoplay.unwrap_or(true)).await
+    audio_core.load_audio_async(url, start_pos, duration, autoplay.unwrap_or(true), track_id).await
+}
+
+#[tauri::command]
+fn get_cache_lyrics(track_id: String) -> Option<String> {
+    storage::get_cached_lyrics(&track_id)
+}
+
+#[tauri::command]
+fn save_cache_lyrics(track_id: String, lyrics_json: String) {
+    storage::save_cached_lyrics(&track_id, &lyrics_json);
+}
+
+#[tauri::command]
+fn get_cache_stats() -> serde_json::Value {
+    let (bytes, count) = storage::get_cache_stats();
+    serde_json::json!({
+        "bytes": bytes,
+        "count": count,
+        "path": storage::get_cache_dir().to_string_lossy().to_string()
+    })
+}
+
+#[tauri::command]
+fn clear_disk_cache() {
+    storage::clear_cache();
+}
+
+#[tauri::command]
+fn open_cache_folder() {
+    let p = storage::get_cache_dir();
+    let _ = std::fs::create_dir_all(&p);
+    open_external(p.to_string_lossy().to_string());
 }
 
 #[tauri::command]
@@ -345,7 +378,12 @@ pub fn run() {
             rust_audio_set_volume,
             rust_audio_set_speed,
             rust_audio_get_state,
-            rust_audio_get_frequency_data
+            rust_audio_get_frequency_data,
+            get_cache_lyrics,
+            save_cache_lyrics,
+            get_cache_stats,
+            clear_disk_cache,
+            open_cache_folder
         ])
         .setup(move |app| {
             let _ = app.global_shortcut().register(Shortcut::new(None, Code::MediaPlayPause));

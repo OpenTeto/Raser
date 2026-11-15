@@ -1,3 +1,4 @@
+use crate::storage;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -268,6 +269,7 @@ impl AudioCore {
         start_pos_secs: Option<f64>,
         duration_hint: Option<f64>,
         autoplay: bool,
+        track_id: Option<String>,
     ) -> Result<AudioState, String> {
         let current_gen = self.load_generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.is_loading.store(true, Ordering::SeqCst);
@@ -292,7 +294,19 @@ impl AudioCore {
 
         let this = Arc::clone(self);
         tauri::async_runtime::spawn_blocking(move || {
-            let bytes_res = if url.starts_with("http://") || url.starts_with("https://") {
+            let mut cached_bytes_opt = None;
+            if let Some(ref tid) = track_id {
+                if let Some(cached_path) = storage::get_cached_audio_path(tid) {
+                    if let Ok(b) = std::fs::read(&cached_path) {
+                        log::info!("AudioCore: Loaded track {} from disk cache {:?}", tid, cached_path);
+                        cached_bytes_opt = Some(b);
+                    }
+                }
+            }
+
+            let bytes_res = if let Some(b) = cached_bytes_opt {
+                Ok(b)
+            } else if url.starts_with("http://") || url.starts_with("https://") {
                 let client = match reqwest::blocking::Client::builder()
                     .timeout(Duration::from_secs(30))
                     .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -335,8 +349,6 @@ impl AudioCore {
                     Err(e) => Err(format!("Failed to read local file '{}': {:?}", path_str, e)),
                 }
             };
-
-            // Check if superseded by a newer load request
             if this.load_generation.load(Ordering::SeqCst) != current_gen {
                 return Err("Superseded by newer load".to_string());
             }
@@ -354,6 +366,14 @@ impl AudioCore {
 
             let bytes_arc = Arc::new(bytes);
             *this.cached_bytes.lock().unwrap() = Some(Arc::clone(&bytes_arc));
+
+            if let Some(ref tid) = track_id {
+                let tid_clone = tid.clone();
+                let bytes_clone = Arc::clone(&bytes_arc);
+                std::thread::spawn(move || {
+                    storage::save_cached_audio(&tid_clone, &bytes_clone);
+                });
+            }
 
             if let Err(e) = this.ensure_player() {
                 log::error!("Error ensuring audio player: {:?}", e);
