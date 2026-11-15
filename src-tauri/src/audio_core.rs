@@ -1,7 +1,7 @@
 use crate::storage;
-use std::io::{Cursor, Read};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use rodio::decoder::Decoder;
@@ -14,6 +14,126 @@ use serde::{Deserialize, Serialize};
 
 const FFT_SAMPLE_COUNT: usize = 512;
 const FFT_BIN_COUNT: usize = 64;
+const PROGRESSIVE_PREBUFFER_BYTES: usize = 192 * 1024;
+
+struct ProgressiveBuffer {
+    data: Vec<u8>,
+    finished: bool,
+    error: Option<String>,
+    total_len: Option<u64>,
+}
+
+struct SharedProgressive {
+    state: Mutex<ProgressiveBuffer>,
+    condvar: Condvar,
+    load_gen: Arc<AtomicU64>,
+}
+
+struct ProgressiveReader {
+    shared: Arc<SharedProgressive>,
+    pos: u64,
+    expected_gen: u64,
+}
+
+impl ProgressiveReader {
+    fn new(shared: Arc<SharedProgressive>, expected_gen: u64) -> Self {
+        Self {
+            shared,
+            pos: 0,
+            expected_gen,
+        }
+    }
+}
+
+impl Read for ProgressiveReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let mut state = self.shared.state.lock().map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, "Progressive buffer lock poisoned")
+        })?;
+
+        loop {
+            if self.shared.load_gen.load(Ordering::SeqCst) != self.expected_gen {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "Superseded by newer load"));
+            }
+
+            let available = state.data.len() as u64;
+            if self.pos < available {
+                let start = self.pos as usize;
+                let to_copy = (state.data.len() - start).min(buf.len());
+                buf[..to_copy].copy_from_slice(&state.data[start..start + to_copy]);
+                self.pos += to_copy as u64;
+                return Ok(to_copy);
+            }
+
+            if state.finished {
+                return Ok(0);
+            }
+
+            if let Some(ref err) = state.error {
+                return Err(io::Error::new(io::ErrorKind::Other, err.clone()));
+            }
+
+            let (guard, _) = self
+                .shared
+                .condvar
+                .wait_timeout(state, Duration::from_millis(100))
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::Other, "Progressive buffer condvar error")
+                })?;
+            state = guard;
+        }
+    }
+}
+
+impl Seek for ProgressiveReader {
+    fn seek(&mut self, style: SeekFrom) -> io::Result<u64> {
+        let mut state = self.shared.state.lock().map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, "Progressive buffer lock poisoned")
+        })?;
+
+        let new_pos: i64 = match style {
+            SeekFrom::Start(offset) => offset as i64,
+            SeekFrom::Current(offset) => (self.pos as i64).saturating_add(offset),
+            SeekFrom::End(offset) => {
+                loop {
+                    if self.shared.load_gen.load(Ordering::SeqCst) != self.expected_gen {
+                        return Err(io::Error::new(io::ErrorKind::Interrupted, "Superseded by newer load"));
+                    }
+                    if let Some(total) = state.total_len {
+                        break (total as i64).saturating_add(offset);
+                    }
+                    if state.finished {
+                        break (state.data.len() as i64).saturating_add(offset);
+                    }
+                    if let Some(ref err) = state.error {
+                        return Err(io::Error::new(io::ErrorKind::Other, err.clone()));
+                    }
+                    let (guard, _) = self
+                        .shared
+                        .condvar
+                        .wait_timeout(state, Duration::from_millis(100))
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::Other, "Progressive seek condvar error")
+                        })?;
+                    state = guard;
+                }
+            }
+        };
+
+        if new_pos < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid seek to negative position",
+            ));
+        }
+
+        self.pos = new_pos as u64;
+        Ok(self.pos)
+    }
+}
 
 fn extract_track_id_from_url(url: &str) -> Option<String> {
     if let Some(pos) = url.find('?') {
@@ -330,11 +450,16 @@ impl AudioCore {
                 }
             }
 
-            let bytes_res = if let Some(b) = cached_bytes_opt {
-                Ok(b)
-            } else if url.starts_with("http://") || url.starts_with("https://") {
+            enum LoadedDecoder {
+                Buffered(Decoder<Cursor<Vec<u8>>>),
+                Progressive(Decoder<ProgressiveReader>),
+            }
+
+            let loaded_decoder = if cached_bytes_opt.is_none()
+                && (url.starts_with("http://") || url.starts_with("https://"))
+            {
                 let client = match reqwest::blocking::Client::builder()
-                    .timeout(Duration::from_secs(30))
+                    .timeout(Duration::from_secs(60))
                     .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
                     .build()
                 {
@@ -344,130 +469,251 @@ impl AudioCore {
 
                 let resp = match client.get(&url).send() {
                     Ok(r) => r,
-                    Err(e) => return Err(format!("Failed to fetch stream URL: {:?}", e)),
+                    Err(e) => {
+                        let err_msg = format!("Failed to fetch stream URL: {:?}", e);
+                        log::error!("Audio load failed for {}: {}", url, err_msg);
+                        *this.current_error.lock().unwrap() = Some(err_msg.clone());
+                        this.is_loading.store(false, Ordering::SeqCst);
+                        this.is_playing.store(false, Ordering::SeqCst);
+                        return Err(err_msg);
+                    }
                 };
 
                 if !resp.status().is_success() {
-                    return Err(format!(
+                    let err_msg = format!(
                         "HTTP error {}: {}",
                         resp.status().as_u16(),
                         resp.status().canonical_reason().unwrap_or("Failed")
-                    ));
-                }
-
-                let mut stream_resp = resp;
-                let mut buf = Vec::with_capacity(3 * 1024 * 1024);
-                let mut chunk = [0u8; 32768];
-                let mut read_err = None;
-
-                loop {
-                    if this.load_generation.load(Ordering::SeqCst) != current_gen {
-                        return Err("Superseded by newer load".to_string());
-                    }
-                    match stream_resp.read(&mut chunk) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            buf.extend_from_slice(&chunk[..n]);
-                        }
-                        Err(e) => {
-                            read_err = Some(e);
-                            break;
-                        }
-                    }
-                }
-
-                if buf.is_empty() {
-                    if let Some(e) = read_err {
-                        Err(format!("Failed to read stream response bytes: {:?}", e))
-                    } else {
-                        Err("Empty stream response".to_string())
-                    }
-                } else {
-                    Ok(buf)
-                }
-            } else {
-                let mut path_str = if let Some(stripped) = url.strip_prefix("file:///") {
-                    stripped.replace('/', "\\")
-                } else if let Some(stripped) = url.strip_prefix("file://") {
-                    stripped.replace('/', "\\")
-                } else {
-                    url.clone()
-                };
-                if let Ok(decoded) = urlencoding::decode(&path_str) {
-                    path_str = decoded.into_owned();
-                }
-                match std::fs::read(&path_str) {
-                    Ok(b) => Ok(b),
-                    Err(e) => Err(format!("Failed to read local file '{}': {:?}", path_str, e)),
-                }
-            };
-            if this.load_generation.load(Ordering::SeqCst) != current_gen {
-                return Err("Superseded by newer load".to_string());
-            }
-
-            let bytes = match bytes_res {
-                Ok(b) => b,
-                Err(err_msg) => {
+                    );
                     log::error!("Audio load failed for {}: {}", url, err_msg);
                     *this.current_error.lock().unwrap() = Some(err_msg.clone());
                     this.is_loading.store(false, Ordering::SeqCst);
                     this.is_playing.store(false, Ordering::SeqCst);
                     return Err(err_msg);
                 }
-            };
 
-            let bytes_arc = Arc::new(bytes);
-            *this.cached_bytes.lock().unwrap() = Some(Arc::clone(&bytes_arc));
-
-            if let Some(ref tid) = effective_tid {
-                let tid_clone = tid.clone();
-                let bytes_clone = Arc::clone(&bytes_arc);
-                std::thread::spawn(move || {
-                    storage::save_cached_audio(&tid_clone, &bytes_clone);
-                });
-            }
-
-            if let Err(e) = this.ensure_player() {
-                log::error!("Error ensuring audio player: {:?}", e);
-                *this.current_error.lock().unwrap() = Some(e.clone());
-                this.is_loading.store(false, Ordering::SeqCst);
-                return Err(e);
-            }
-
-            let cursor = Cursor::new(bytes_arc.as_ref().clone());
-            let decoder = match Decoder::new(cursor) {
-                Ok(d) => d,
-                Err(e) => {
-                    let err_msg = format!("Audio decoder error for {}: {:?}", url, e);
-                    log::error!("{}", err_msg);
-                    *this.current_error.lock().unwrap() = Some(err_msg.clone());
-                    this.is_loading.store(false, Ordering::SeqCst);
-                    return Err(err_msg);
+                if this.load_generation.load(Ordering::SeqCst) != current_gen {
+                    return Err("Superseded by newer load".to_string());
                 }
+
+                *this.cached_bytes.lock().unwrap() = None;
+
+                let total_len = resp.content_length();
+                let initial_cap = total_len.map(|l| l as usize).unwrap_or(3 * 1024 * 1024);
+                let shared = Arc::new(SharedProgressive {
+                    state: Mutex::new(ProgressiveBuffer {
+                        data: Vec::with_capacity(initial_cap),
+                        finished: false,
+                        error: None,
+                        total_len,
+                    }),
+                    condvar: Condvar::new(),
+                    load_gen: Arc::clone(&this.load_generation),
+                });
+
+                let shared_dl = Arc::clone(&shared);
+                let this_dl = Arc::clone(&this);
+                let tid_dl = effective_tid.clone();
+                std::thread::spawn(move || {
+                    let mut stream_resp = resp;
+                    let mut chunk = [0u8; 32768];
+                    loop {
+                        if this_dl.load_generation.load(Ordering::SeqCst) != current_gen {
+                            shared_dl.condvar.notify_all();
+                            return;
+                        }
+                        match stream_resp.read(&mut chunk) {
+                            Ok(0) => {
+                                let completed_bytes = {
+                                    let mut st = shared_dl.state.lock().unwrap();
+                                    st.finished = true;
+                                    if st.data.is_empty() {
+                                        st.error = Some("Empty stream response".to_string());
+                                        None
+                                    } else {
+                                        Some(st.data.clone())
+                                    }
+                                };
+                                shared_dl.condvar.notify_all();
+
+                                if let Some(full_bytes) = completed_bytes {
+                                    if this_dl.load_generation.load(Ordering::SeqCst) == current_gen {
+                                        let bytes_arc = Arc::new(full_bytes);
+                                        *this_dl.cached_bytes.lock().unwrap() = Some(Arc::clone(&bytes_arc));
+                                        if let Some(ref tid) = tid_dl {
+                                            storage::save_cached_audio(tid, &bytes_arc);
+                                        }
+                                    }
+                                }
+                                return;
+                            }
+                            Ok(n) => {
+                                {
+                                    let mut st = shared_dl.state.lock().unwrap();
+                                    st.data.extend_from_slice(&chunk[..n]);
+                                }
+                                shared_dl.condvar.notify_all();
+                            }
+                            Err(e) => {
+                                {
+                                    let mut st = shared_dl.state.lock().unwrap();
+                                    st.error = Some(format!("Failed to read stream response bytes: {:?}", e));
+                                    st.finished = true;
+                                }
+                                shared_dl.condvar.notify_all();
+                                return;
+                            }
+                        }
+                    }
+                });
+
+                // Wait only until prebuffer (192 KB) or EOF arrives so playback starts in <1s
+                {
+                    let mut st = shared.state.lock().unwrap();
+                    while st.data.len() < PROGRESSIVE_PREBUFFER_BYTES
+                        && !st.finished
+                        && st.error.is_none()
+                    {
+                        if this.load_generation.load(Ordering::SeqCst) != current_gen {
+                            return Err("Superseded by newer load".to_string());
+                        }
+                        let (guard, _) = shared
+                            .condvar
+                            .wait_timeout(st, Duration::from_millis(100))
+                            .unwrap();
+                        st = guard;
+                    }
+                    if this.load_generation.load(Ordering::SeqCst) != current_gen {
+                        return Err("Superseded by newer load".to_string());
+                    }
+                    if st.data.is_empty() {
+                        let err_msg = st
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "Empty stream response".to_string());
+                        log::error!("Audio load failed for {}: {}", url, err_msg);
+                        *this.current_error.lock().unwrap() = Some(err_msg.clone());
+                        this.is_loading.store(false, Ordering::SeqCst);
+                        this.is_playing.store(false, Ordering::SeqCst);
+                        return Err(err_msg);
+                    }
+                }
+
+                if let Err(e) = this.ensure_player() {
+                    log::error!("Error ensuring audio player: {:?}", e);
+                    *this.current_error.lock().unwrap() = Some(e.clone());
+                    this.is_loading.store(false, Ordering::SeqCst);
+                    return Err(e);
+                }
+
+                let reader = ProgressiveReader::new(Arc::clone(&shared), current_gen);
+                let decoder = match Decoder::new(reader) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let err_msg = format!("Audio decoder error for {}: {:?}", url, e);
+                        log::error!("{}", err_msg);
+                        *this.current_error.lock().unwrap() = Some(err_msg.clone());
+                        this.is_loading.store(false, Ordering::SeqCst);
+                        return Err(err_msg);
+                    }
+                };
+                LoadedDecoder::Progressive(decoder)
+            } else {
+                let bytes_res = if let Some(b) = cached_bytes_opt {
+                    Ok(b)
+                } else {
+                    let mut path_str = if let Some(stripped) = url.strip_prefix("file:///") {
+                        stripped.replace('/', "\\")
+                    } else if let Some(stripped) = url.strip_prefix("file://") {
+                        stripped.replace('/', "\\")
+                    } else {
+                        url.clone()
+                    };
+                    if let Ok(decoded) = urlencoding::decode(&path_str) {
+                        path_str = decoded.into_owned();
+                    }
+                    match std::fs::read(&path_str) {
+                        Ok(b) => Ok(b),
+                        Err(e) => Err(format!("Failed to read local file '{}': {:?}", path_str, e)),
+                    }
+                };
+
+                if this.load_generation.load(Ordering::SeqCst) != current_gen {
+                    return Err("Superseded by newer load".to_string());
+                }
+
+                let bytes = match bytes_res {
+                    Ok(b) => b,
+                    Err(err_msg) => {
+                        log::error!("Audio load failed for {}: {}", url, err_msg);
+                        *this.current_error.lock().unwrap() = Some(err_msg.clone());
+                        this.is_loading.store(false, Ordering::SeqCst);
+                        this.is_playing.store(false, Ordering::SeqCst);
+                        return Err(err_msg);
+                    }
+                };
+
+                let bytes_arc = Arc::new(bytes);
+                *this.cached_bytes.lock().unwrap() = Some(Arc::clone(&bytes_arc));
+
+                if let Err(e) = this.ensure_player() {
+                    log::error!("Error ensuring audio player: {:?}", e);
+                    *this.current_error.lock().unwrap() = Some(e.clone());
+                    this.is_loading.store(false, Ordering::SeqCst);
+                    return Err(e);
+                }
+
+                let cursor = Cursor::new(bytes_arc.as_ref().clone());
+                let decoder = match Decoder::new(cursor) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let err_msg = format!("Audio decoder error for {}: {:?}", url, e);
+                        log::error!("{}", err_msg);
+                        *this.current_error.lock().unwrap() = Some(err_msg.clone());
+                        this.is_loading.store(false, Ordering::SeqCst);
+                        return Err(err_msg);
+                    }
+                };
+                LoadedDecoder::Buffered(decoder)
             };
 
-            if let Some(total) = decoder.total_duration() {
+            let (total_dur, channels) = match &loaded_decoder {
+                LoadedDecoder::Buffered(d) => (d.total_duration(), d.channels().get() as usize),
+                LoadedDecoder::Progressive(d) => (d.total_duration(), d.channels().get() as usize),
+            };
+
+            if let Some(total) = total_dur {
                 *this.current_duration.lock().unwrap() = total.as_secs_f64();
             } else if let Some(dur) = duration_hint {
                 *this.current_duration.lock().unwrap() = dur;
             }
 
-            let channels = decoder.channels().get() as usize;
             let (producer, consumer) = rtrb::RingBuffer::new(4096);
             *this.consumer.lock().unwrap() = Some(consumer);
-
-            let viz_source = VisualizerSource {
-                inner: decoder,
-                channels: channels.max(1),
-                sample_accum: 0.0,
-                channel_idx: 0,
-                producer,
-            };
 
             if let Ok(player_guard) = this.player.lock() {
                 if let Some(player) = player_guard.as_ref() {
                     player.clear();
-                    player.append(viz_source);
+                    match loaded_decoder {
+                        LoadedDecoder::Buffered(decoder) => {
+                            player.append(VisualizerSource {
+                                inner: decoder,
+                                channels: channels.max(1),
+                                sample_accum: 0.0,
+                                channel_idx: 0,
+                                producer,
+                            });
+                        }
+                        LoadedDecoder::Progressive(decoder) => {
+                            player.append(VisualizerSource {
+                                inner: decoder,
+                                channels: channels.max(1),
+                                sample_accum: 0.0,
+                                channel_idx: 0,
+                                producer,
+                            });
+                        }
+                    }
 
                     if let Some(start_sec) = start_pos_secs {
                         if start_sec > 0.0 {
