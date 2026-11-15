@@ -256,6 +256,7 @@ pub struct AudioCore {
     fft_plan: Arc<dyn Fft<f32>>,
     hann_window: Vec<f32>,
     cached_bytes: Arc<Mutex<Option<Arc<Vec<u8>>>>>,
+    active_progressive: Arc<Mutex<Option<(Arc<SharedProgressive>, u64)>>>,
     current_url: Arc<Mutex<Option<String>>>,
     current_duration: Arc<Mutex<f64>>,
     current_error: Arc<Mutex<Option<String>>>,
@@ -287,6 +288,7 @@ impl AudioCore {
             fft_plan,
             hann_window,
             cached_bytes: Arc::new(Mutex::new(None)),
+            active_progressive: Arc::new(Mutex::new(None)),
             current_url: Arc::new(Mutex::new(None)),
             current_duration: Arc::new(Mutex::new(0.0)),
             current_error: Arc::new(Mutex::new(None)),
@@ -375,18 +377,23 @@ impl AudioCore {
         let target_pos = Duration::from_secs_f64(position_secs.max(0.0));
         let player_guard = self.player.lock().map_err(|e| e.to_string())?;
         if let Some(player) = player_guard.as_ref() {
-            // Attempt fast in-stream seek first
-            if player.try_seek(target_pos).is_ok() {
+            // Attempt fast in-stream seek first (only if player is not empty)
+            if !player.empty() && player.try_seek(target_pos).is_ok() {
                 self.has_ended.store(false, Ordering::SeqCst);
+                if self.is_playing.load(Ordering::SeqCst) {
+                    player.play();
+                }
                 return Ok(());
             }
 
-            // Fallback: If try_seek fails, reconstruct decoder from cached bytes
+            // Fallback 1: Reconstruct decoder from cached full bytes
             drop(player_guard);
             if let Some(bytes_arc) = self.cached_bytes.lock().map_err(|e| e.to_string())?.clone() {
                 let cursor = Cursor::new(bytes_arc.as_ref().clone());
                 if let Ok(mut decoder) = Decoder::new(cursor) {
-                    let _ = decoder.try_seek(target_pos);
+                    if target_pos > Duration::ZERO {
+                        let _ = decoder.try_seek(target_pos);
+                    }
                     let channels = decoder.channels().get() as usize;
                     let (producer, consumer) = rtrb::RingBuffer::new(4096);
                     *self.consumer.lock().unwrap() = Some(consumer);
@@ -402,13 +409,53 @@ impl AudioCore {
                     if let Some(player) = self.player.lock().map_err(|e| e.to_string())?.as_ref() {
                         player.clear();
                         player.append(viz_source);
-                        let _ = player.try_seek(target_pos);
+                        if target_pos > Duration::ZERO {
+                            let _ = player.try_seek(target_pos);
+                        }
                         if self.is_playing.load(Ordering::SeqCst) {
                             player.play();
                         } else {
                             player.pause();
                         }
                         self.has_ended.store(false, Ordering::SeqCst);
+                    }
+                    return Ok(());
+                }
+            }
+
+            // Fallback 2: Reconstruct decoder from active progressive stream buffer (e.g. when restarting at 0:00 while still downloading)
+            if let Some((shared_prog, prog_gen)) = self.active_progressive.lock().map_err(|e| e.to_string())?.clone() {
+                if self.load_generation.load(Ordering::SeqCst) == prog_gen {
+                    let reader = ProgressiveReader::new(shared_prog, prog_gen);
+                    if let Ok(mut decoder) = Decoder::new(reader) {
+                        if target_pos > Duration::ZERO {
+                            let _ = decoder.try_seek(target_pos);
+                        }
+                        let channels = decoder.channels().get() as usize;
+                        let (producer, consumer) = rtrb::RingBuffer::new(4096);
+                        *self.consumer.lock().unwrap() = Some(consumer);
+
+                        let viz_source = VisualizerSource {
+                            inner: decoder,
+                            channels: channels.max(1),
+                            sample_accum: 0.0,
+                            channel_idx: 0,
+                            producer,
+                        };
+
+                        if let Some(player) = self.player.lock().map_err(|e| e.to_string())?.as_ref() {
+                            player.clear();
+                            player.append(viz_source);
+                            if target_pos > Duration::ZERO {
+                                let _ = player.try_seek(target_pos);
+                            }
+                            if self.is_playing.load(Ordering::SeqCst) {
+                                player.play();
+                            } else {
+                                player.pause();
+                            }
+                            self.has_ended.store(false, Ordering::SeqCst);
+                        }
                     }
                 }
             }
@@ -427,10 +474,17 @@ impl AudioCore {
         let current_gen = self.load_generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.is_loading.store(true, Ordering::SeqCst);
         self.has_ended.store(false, Ordering::SeqCst);
+        self.track_has_played.store(false, Ordering::SeqCst);
+        if autoplay {
+            self.is_playing.store(true, Ordering::SeqCst);
+        }
         *self.current_error.lock().unwrap() = None;
         *self.current_url.lock().unwrap() = Some(url.clone());
+        *self.active_progressive.lock().unwrap() = None;
         if let Some(dur) = duration_hint {
             *self.current_duration.lock().unwrap() = dur;
+        } else {
+            *self.current_duration.lock().unwrap() = 0.0;
         }
 
         // Immediately stop previous audio so there is no audio bleed while loading
@@ -520,6 +574,7 @@ impl AudioCore {
                     condvar: Condvar::new(),
                     load_gen: Arc::clone(&this.load_generation),
                 });
+                *this.active_progressive.lock().unwrap() = Some((Arc::clone(&shared), current_gen));
 
                 let shared_dl = Arc::clone(&shared);
                 let this_dl = Arc::clone(&this);
@@ -758,7 +813,10 @@ impl AudioCore {
     }
 
     pub fn get_state(&self) -> AudioState {
-        let (pos, empty) = if let Ok(player_guard) = self.player.lock() {
+        let loading = self.is_loading.load(Ordering::SeqCst);
+        let (pos, empty) = if loading {
+            (0.0, false)
+        } else if let Ok(player_guard) = self.player.lock() {
             if let Some(player) = player_guard.as_ref() {
                 (player.get_pos().as_secs_f64(), player.empty())
             } else {
@@ -768,12 +826,11 @@ impl AudioCore {
             (0.0, true)
         };
 
-        if pos > 0.1 {
+        if !loading && pos > 0.1 {
             self.track_has_played.store(true, Ordering::SeqCst);
         }
 
         let duration = *self.current_duration.lock().unwrap_or_else(|e| e.into_inner());
-        let loading = self.is_loading.load(Ordering::SeqCst);
         let playing = self.is_playing.load(Ordering::SeqCst);
         let vol = *self.volume.lock().unwrap_or_else(|e| e.into_inner());
         let spd = *self.speed.lock().unwrap_or_else(|e| e.into_inner());
