@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use tauri::Emitter;
 
-const CURRENT_VERSION: &str = "1.0.0";
+const CURRENT_VERSION: &str = "1.1.1";
 const VERSION_ENDPOINT: &str = "https://app.raserapp.online/api/desktop-version";
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
@@ -75,8 +75,8 @@ pub async fn check_for_update() -> Result<UpdateInfo, String> {
             .unwrap_or(false);
 
     let default_url = format!(
-        "https://github.com/YourDarkstFear/RaserNative/releases/download/v{}/RaserNative-Setup.exe",
-        data.version
+        "https://github.com/tetoverse/Raser/releases/download/v{}/Raser_{}_x64-setup.exe",
+        data.version, data.version
     );
 
     Ok(UpdateInfo {
