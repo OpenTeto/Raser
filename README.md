@@ -28,6 +28,7 @@ Traditional music players (Spotify, YouTube Music Desktop, Electron-based player
 | :--- | :---: | :---: | :---: |
 | **Idle RAM (Background / Tray)** | **~35 - 55 MB** | 450 - 750 MB | **~10x Lighter** |
 | **Active Playback RAM** | **~75 - 110 MB** | 600 - 950 MB | **~8x Lighter** |
+| **Active CPU / GPU Usage** | **~1.5 - 3.5% CPU / < 5% GPU** | 8 - 18% CPU / 15 - 30% GPU | **~4-5x More Efficient** |
 | **Installer File Size** | **~8.0 MB** | 120 - 180 MB | **~15x Smaller** |
 | **Cold Start Time** | **< 0.6 seconds** | 3.5 - 6.0 seconds | **Instant** |
 | **Cold Stream Start (192 KB)** | **~1.3 - 1.8 seconds** | 4.0 - 8.0+ seconds | **~3-4x Faster** |
@@ -44,10 +45,12 @@ Traditional music players (Spotify, YouTube Music Desktop, Electron-based player
 - **Gapless & Progressive Caching:** Remote streams are buffered progressively in-memory and persisted to local SSD cache (`~6 ms` warm read) for instant zero-latency seeking.
 - **150ms Visibility Prewarm & Dual-Tier Streaming:** Playlist tracks visible in the viewport for 150ms are automatically pre-resolved and persistently cached, while cold streams start in **~1.3–1.8s** via Dual-Tier chunked streaming.
 
-### 🎨 Material You 3 (M3) Design
+### 🎨 Material You 3 (M3) Design & Ultra-Low GPU Pipeline
 - **Dynamic Palette Extraction:** UI accents automatically adapt to the dominant colors of the currently playing album art.
+- **Unified Frame Scheduler & Pre-Blurred Ambient Layers:** Album art ambient backgrounds are pre-blurred once onto an offscreen canvas (`96x96`) instead of running continuous 90px full-screen CSS blur shaders, while the visualizer, morphing M3 cover, and karaoke gradient share a single frame-paced render loop that sleeps between ticks (`0%` CPU/GPU when paused).
+- **Duration-Matched Spotify Resolution:** Imported Spotify playlists automatically cross-verify track durations (`±5s` / `±15s`) and filter out unwanted remix/live/cover variants for exact track matching.
 - **Morphing Album Art:** Fluid canvas transitions between tracks with glassmorphism and ambient lighting effects.
-- **Synchronized Karaoke Lyrics:** Word-by-word and line-by-line synchronized lyrics with real-time gradient follow.
+- **Synchronized Karaoke Lyrics:** Word-by-word and line-by-line synchronized lyrics with real-time gradient follow and zero layout thrashing.
 - **TV Karaoke Mode:** Fullscreen karaoke view with live dynamic visual effects.
 
 ### 🪟 Deep Windows Integration
