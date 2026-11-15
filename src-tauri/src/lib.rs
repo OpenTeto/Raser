@@ -516,11 +516,20 @@ pub fn run() {
                 }
             });
 
-            // Periodic working set memory trim to keep background RAM usage minimal (< 90MB)
-            std::thread::spawn(|| {
+            // Periodic working set memory trim ONLY when window is hidden/minimized to tray,
+            // avoiding constant page-fault thrashing (40MB <-> 380MB spikes + disk/CPU load) while visible.
+            let app_handle_trim = app.handle().clone();
+            std::thread::spawn(move || {
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(30));
-                    trim_working_set();
+                    let should_trim = if let Some(w) = app_handle_trim.get_webview_window("main") {
+                        !w.is_visible().unwrap_or(true) || w.is_minimized().unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    if should_trim {
+                        trim_working_set();
+                    }
                 }
             });
             Ok(())
