@@ -29,6 +29,20 @@ struct SharedProgressive {
     load_gen: Arc<AtomicU64>,
 }
 
+fn shared_http_client() -> Result<&'static reqwest::blocking::Client, String> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::blocking::Client, String>> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .build()
+                .map_err(|e| format!("Failed to create HTTP client: {:?}", e))
+        })
+        .as_ref()
+        .map_err(|e| e.clone())
+}
+
 struct ProgressiveReader {
     shared: Arc<SharedProgressive>,
     pos: u64,
@@ -458,13 +472,9 @@ impl AudioCore {
             let loaded_decoder = if cached_bytes_opt.is_none()
                 && (url.starts_with("http://") || url.starts_with("https://"))
             {
-                let client = match reqwest::blocking::Client::builder()
-                    .timeout(Duration::from_secs(60))
-                    .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                    .build()
-                {
+                let client = match shared_http_client() {
                     Ok(c) => c,
-                    Err(e) => return Err(format!("Failed to create HTTP client: {:?}", e)),
+                    Err(e) => return Err(e),
                 };
 
                 let resp = match client.get(&url).send() {
