@@ -1,5 +1,5 @@
 use crate::storage;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -329,9 +329,35 @@ impl AudioCore {
                     ));
                 }
 
-                match resp.bytes() {
-                    Ok(b) => Ok(b.to_vec()),
-                    Err(e) => Err(format!("Failed to read stream response bytes: {:?}", e)),
+                let mut stream_resp = resp;
+                let mut buf = Vec::with_capacity(3 * 1024 * 1024);
+                let mut chunk = [0u8; 32768];
+                let mut read_err = None;
+
+                loop {
+                    if this.load_generation.load(Ordering::SeqCst) != current_gen {
+                        return Err("Superseded by newer load".to_string());
+                    }
+                    match stream_resp.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                        }
+                        Err(e) => {
+                            read_err = Some(e);
+                            break;
+                        }
+                    }
+                }
+
+                if buf.is_empty() {
+                    if let Some(e) = read_err {
+                        Err(format!("Failed to read stream response bytes: {:?}", e))
+                    } else {
+                        Err("Empty stream response".to_string())
+                    }
+                } else {
+                    Ok(buf)
                 }
             } else {
                 let mut path_str = if let Some(stripped) = url.strip_prefix("file:///") {
