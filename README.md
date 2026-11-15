@@ -24,7 +24,7 @@
 
 Traditional music players (Spotify, YouTube Music Desktop, Electron-based players) consume massive system resources even when idling in the background. **Raser was engineered from the ground up to solve this.**
 
-| Metric | Raser v1.1.0 (Rust Audio Core) | Electron / Spotify Web Player | Difference |
+| Metric | Raser v1.1.0 (Rust Audio Core) | Electron / Spotify Player | Difference |
 | :--- | :---: | :---: | :---: |
 | **Idle RAM (Background / Tray)** | **~35 - 55 MB** | 450 - 750 MB | **~10x Lighter** |
 | **Active Playback RAM** | **~75 - 110 MB** | 600 - 950 MB | **~8x Lighter** |
