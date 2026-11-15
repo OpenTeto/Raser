@@ -138,7 +138,21 @@
     rustAudioSetVolume: (volume) => invoke('rust_audio_set_volume', { volume }),
     rustAudioSetSpeed: (speed) => invoke('rust_audio_set_speed', { speed }),
     rustAudioGetState: () => invoke('rust_audio_get_state'),
-    rustAudioGetFrequencyData: () => cachedRustFreqData,
+    rustAudioGetFrequencyData: () => {
+      const now = performance.now();
+      if (_isPlaying && !document.hidden && !isFetchingFreq && now - lastFreqFetchMs >= 32) {
+        lastFreqFetchMs = now;
+        isFetchingFreq = true;
+        invoke('rust_audio_get_frequency_data').then(data => {
+          if (data && data.length) {
+            cachedRustFreqData.set(data.subarray ? data.subarray(0, cachedRustFreqData.length) : data.slice(0, cachedRustFreqData.length));
+          }
+        }).catch(() => {}).finally(() => {
+          isFetchingFreq = false;
+        });
+      }
+      return cachedRustFreqData;
+    },
     getCacheLyrics: (trackId) => invoke('get_cache_lyrics', { trackId }),
     saveCacheLyrics: (trackId, lyricsJson) => invoke('save_cache_lyrics', { trackId, lyricsJson }),
     getCacheStats: () => invoke('get_cache_stats'),
@@ -159,6 +173,7 @@
   let currentLoadToken = 0;
   let cachedRustFreqData = new Uint8Array(64);
   let isFetchingFreq = false;
+  let lastFreqFetchMs = 0;
 
   const hookNativeAudioElement = (audio) => {
     if (!audio || audio.__rustAudioHooked) return;
@@ -374,9 +389,19 @@
 
     // Continuous sync loop with Rust audio core state
     let lastDispatchedPos = 0;
+    let isFetchingState = false;
+    let idleTicks = 0;
     setInterval(() => {
-      if (!document.hidden || _isPlaying) {
-        invoke('rust_audio_get_state').then(st => {
+      if (isFetchingState) return;
+      if (!_isPlaying && !_isLoading) {
+        if (document.hidden) return;
+        idleTicks = (idleTicks + 1) % 6;
+        if (idleTicks !== 0) return; // Poll only ~3.5x/sec when paused in foreground
+      } else {
+        idleTicks = 0;
+      }
+      isFetchingState = true;
+      invoke('rust_audio_get_state').then(st => {
         if (!st) return;
         const wasPlaying = _isPlaying;
         _isPlaying = !!st.playing;
@@ -406,26 +431,12 @@
           audio.dispatchEvent(new Event('pause'));
           invoke('taskbar_playback_state', { playing: false }).catch(() => {});
         }
-      }).catch(() => {});
-    }, 45);
+      }).catch(() => {}).finally(() => {
+        isFetchingState = false;
+      });
+    }, 55);
 
-    // Fast polling loop for FFT frequency data (~30 FPS)
-    setInterval(() => {
-      if (_isPlaying && !document.hidden && !isFetchingFreq) {
-        isFetchingFreq = true;
-        invoke('rust_audio_get_frequency_data').then(data => {
-          if (data && data.length) {
-            cachedRustFreqData = new Uint8Array(data);
-          }
-        }).catch(() => {}).finally(() => {
-          isFetchingFreq = false;
-        });
-      } else if (!_isPlaying && cachedRustFreqData.some(v => v > 0)) {
-        for (let i = 0; i < cachedRustFreqData.length; i++) {
-          cachedRustFreqData[i] = Math.floor(cachedRustFreqData[i] * 0.7);
-        }
-      }
-    }, 33);
+    // Demand-driven FFT polling via rustAudioGetFrequencyData avoids background IPC when visualizers are hidden
   };
 
   const tryHookNativeAudio = () => {
