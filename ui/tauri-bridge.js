@@ -213,11 +213,16 @@
           _isPlaying = false;
           _hasEnded = false;
           _isLoading = false;
+          _currentPosition = 0;
+          lastDispatchedPos = 0;
           invoke('rust_audio_pause').catch(() => {});
           return;
         }
         _isLoading = true;
         _hasEnded = false;
+        _currentPosition = 0;
+        lastDispatchedPos = 0;
+        cachedRustFreqData.fill(0);
         audio.dispatchEvent(new Event('loadstart'));
         audio.dispatchEvent(new Event('waiting'));
 
@@ -264,6 +269,8 @@
         }).then((st) => {
           if (loadToken !== currentLoadToken) return;
           _isLoading = false;
+          _currentPosition = (st && typeof st.position === 'number') ? st.position : 0;
+          lastDispatchedPos = _currentPosition;
           if (st && typeof st.duration === 'number' && st.duration > 0) {
             _currentDuration = st.duration;
           } else if (durHint && durHint > 0) {
@@ -274,6 +281,7 @@
           audio.dispatchEvent(new Event('canplay'));
           audio.dispatchEvent(new Event('canplaythrough'));
           if (_isPlaying) {
+            invoke('rust_audio_play').catch(() => {});
             audio.dispatchEvent(new Event('playing'));
           }
         }).catch((err) => {
@@ -401,8 +409,17 @@
         idleTicks = 0;
       }
       isFetchingState = true;
+      const pollToken = currentLoadToken;
       invoke('rust_audio_get_state').then(st => {
-        if (!st) return;
+        if (!st || pollToken !== currentLoadToken) return;
+        if (_isLoading || st.loading) {
+          _currentPosition = 0;
+          if (typeof st.duration === 'number' && st.duration > 0 && st.duration !== _currentDuration) {
+            _currentDuration = st.duration;
+            audio.dispatchEvent(new Event('durationchange'));
+          }
+          return;
+        }
         const wasPlaying = _isPlaying;
         _isPlaying = !!st.playing;
         _currentPosition = typeof st.position === 'number' ? st.position : 0;
