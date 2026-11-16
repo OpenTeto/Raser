@@ -375,23 +375,59 @@ impl AudioCore {
     pub fn seek(&self, position_secs: f64) -> Result<(), String> {
         self.ensure_player()?;
         let target_pos = Duration::from_secs_f64(position_secs.max(0.0));
-        let player_guard = self.player.lock().map_err(|e| e.to_string())?;
-        if let Some(player) = player_guard.as_ref() {
-            // Attempt fast in-stream seek first (only if player is not empty)
-            if !player.empty() && player.try_seek(target_pos).is_ok() {
-                self.has_ended.store(false, Ordering::SeqCst);
-                if self.is_playing.load(Ordering::SeqCst) {
-                    player.play();
+        self.has_ended.store(false, Ordering::SeqCst);
+        if position_secs <= 1.0 {
+            self.track_has_played.store(false, Ordering::SeqCst);
+        }
+
+        // Priority 1: Reconstruct decoder from cached full bytes in memory.
+        // Symphonia/Rodio's in-place player.try_seek(0) on fragmented MP4/WebM streams
+        // frequently returns Ok(()) while leaving the decoder at EOF (silent), so rebuilding
+        // from the in-memory buffer guarantees an instant, glitch-free seek and restart.
+        if let Some(bytes_arc) = self.cached_bytes.lock().map_err(|e| e.to_string())?.clone() {
+            let cursor = Cursor::new(bytes_arc.as_ref().clone());
+            if let Ok(mut decoder) = Decoder::new(cursor) {
+                if target_pos > Duration::from_millis(50) {
+                    let _ = decoder.try_seek(target_pos);
+                }
+                let channels = decoder.channels().get() as usize;
+                let (producer, consumer) = rtrb::RingBuffer::new(4096);
+                *self.consumer.lock().unwrap() = Some(consumer);
+
+                let viz_source = VisualizerSource {
+                    inner: decoder,
+                    channels: channels.max(1),
+                    sample_accum: 0.0,
+                    channel_idx: 0,
+                    producer,
+                };
+
+                if let Some(player) = self.player.lock().map_err(|e| e.to_string())?.as_ref() {
+                    player.clear();
+                    player.append(viz_source);
+                    if target_pos > Duration::from_millis(50) {
+                        let _ = player.try_seek(target_pos);
+                    }
+                    let vol = *self.volume.lock().unwrap_or_else(|e| e.into_inner());
+                    let spd = *self.speed.lock().unwrap_or_else(|e| e.into_inner());
+                    player.set_volume(vol);
+                    player.set_speed(spd);
+                    if self.is_playing.load(Ordering::SeqCst) {
+                        player.play();
+                    } else {
+                        player.pause();
+                    }
                 }
                 return Ok(());
             }
+        }
 
-            // Fallback 1: Reconstruct decoder from cached full bytes
-            drop(player_guard);
-            if let Some(bytes_arc) = self.cached_bytes.lock().map_err(|e| e.to_string())?.clone() {
-                let cursor = Cursor::new(bytes_arc.as_ref().clone());
-                if let Ok(mut decoder) = Decoder::new(cursor) {
-                    if target_pos > Duration::ZERO {
+        // Priority 2: Reconstruct decoder from active progressive stream buffer
+        if let Some((shared_prog, prog_gen)) = self.active_progressive.lock().map_err(|e| e.to_string())?.clone() {
+            if self.load_generation.load(Ordering::SeqCst) == prog_gen {
+                let reader = ProgressiveReader::new(shared_prog, prog_gen);
+                if let Ok(mut decoder) = Decoder::new(reader) {
+                    if target_pos > Duration::from_millis(50) {
                         let _ = decoder.try_seek(target_pos);
                     }
                     let channels = decoder.channels().get() as usize;
@@ -409,54 +445,29 @@ impl AudioCore {
                     if let Some(player) = self.player.lock().map_err(|e| e.to_string())?.as_ref() {
                         player.clear();
                         player.append(viz_source);
-                        if target_pos > Duration::ZERO {
+                        if target_pos > Duration::from_millis(50) {
                             let _ = player.try_seek(target_pos);
                         }
+                        let vol = *self.volume.lock().unwrap_or_else(|e| e.into_inner());
+                        let spd = *self.speed.lock().unwrap_or_else(|e| e.into_inner());
+                        player.set_volume(vol);
+                        player.set_speed(spd);
                         if self.is_playing.load(Ordering::SeqCst) {
                             player.play();
                         } else {
                             player.pause();
                         }
-                        self.has_ended.store(false, Ordering::SeqCst);
                     }
                     return Ok(());
                 }
             }
+        }
 
-            // Fallback 2: Reconstruct decoder from active progressive stream buffer (e.g. when restarting at 0:00 while still downloading)
-            if let Some((shared_prog, prog_gen)) = self.active_progressive.lock().map_err(|e| e.to_string())?.clone() {
-                if self.load_generation.load(Ordering::SeqCst) == prog_gen {
-                    let reader = ProgressiveReader::new(shared_prog, prog_gen);
-                    if let Ok(mut decoder) = Decoder::new(reader) {
-                        if target_pos > Duration::ZERO {
-                            let _ = decoder.try_seek(target_pos);
-                        }
-                        let channels = decoder.channels().get() as usize;
-                        let (producer, consumer) = rtrb::RingBuffer::new(4096);
-                        *self.consumer.lock().unwrap() = Some(consumer);
-
-                        let viz_source = VisualizerSource {
-                            inner: decoder,
-                            channels: channels.max(1),
-                            sample_accum: 0.0,
-                            channel_idx: 0,
-                            producer,
-                        };
-
-                        if let Some(player) = self.player.lock().map_err(|e| e.to_string())?.as_ref() {
-                            player.clear();
-                            player.append(viz_source);
-                            if target_pos > Duration::ZERO {
-                                let _ = player.try_seek(target_pos);
-                            }
-                            if self.is_playing.load(Ordering::SeqCst) {
-                                player.play();
-                            } else {
-                                player.pause();
-                            }
-                            self.has_ended.store(false, Ordering::SeqCst);
-                        }
-                    }
+        // Priority 3: Fallback to in-stream try_seek if neither buffer is available
+        if let Some(player) = self.player.lock().map_err(|e| e.to_string())?.as_ref() {
+            if !player.empty() && player.try_seek(target_pos).is_ok() {
+                if self.is_playing.load(Ordering::SeqCst) {
+                    player.play();
                 }
             }
         }
@@ -838,7 +849,7 @@ impl AudioCore {
         let error = self.current_error.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
         let track_played = self.track_has_played.load(Ordering::SeqCst);
-        let ended = if !loading && empty && track_played && (duration <= 0.0 || pos >= (duration - 1.5).max(0.0)) {
+        let ended = if !loading && empty && track_played {
             self.has_ended.store(true, Ordering::SeqCst);
             self.is_playing.store(false, Ordering::SeqCst);
             true
