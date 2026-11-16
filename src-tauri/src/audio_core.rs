@@ -257,6 +257,7 @@ pub struct AudioCore {
     hann_window: Vec<f32>,
     cached_bytes: Arc<Mutex<Option<Arc<Vec<u8>>>>>,
     active_progressive: Arc<Mutex<Option<(Arc<SharedProgressive>, u64)>>>,
+    seek_offset_secs: Mutex<f64>,
     current_url: Arc<Mutex<Option<String>>>,
     current_duration: Arc<Mutex<f64>>,
     current_error: Arc<Mutex<Option<String>>>,
@@ -289,6 +290,7 @@ impl AudioCore {
             hann_window,
             cached_bytes: Arc::new(Mutex::new(None)),
             active_progressive: Arc::new(Mutex::new(None)),
+            seek_offset_secs: Mutex::new(0.0),
             current_url: Arc::new(Mutex::new(None)),
             current_duration: Arc::new(Mutex::new(0.0)),
             current_error: Arc::new(Mutex::new(None)),
@@ -405,9 +407,7 @@ impl AudioCore {
                 if let Some(player) = self.player.lock().map_err(|e| e.to_string())?.as_ref() {
                     player.clear();
                     player.append(viz_source);
-                    if target_pos > Duration::from_millis(50) {
-                        let _ = player.try_seek(target_pos);
-                    }
+                    *self.seek_offset_secs.lock().unwrap_or_else(|e| e.into_inner()) = position_secs.max(0.0);
                     let vol = *self.volume.lock().unwrap_or_else(|e| e.into_inner());
                     let spd = *self.speed.lock().unwrap_or_else(|e| e.into_inner());
                     player.set_volume(vol);
@@ -445,9 +445,7 @@ impl AudioCore {
                     if let Some(player) = self.player.lock().map_err(|e| e.to_string())?.as_ref() {
                         player.clear();
                         player.append(viz_source);
-                        if target_pos > Duration::from_millis(50) {
-                            let _ = player.try_seek(target_pos);
-                        }
+                        *self.seek_offset_secs.lock().unwrap_or_else(|e| e.into_inner()) = position_secs.max(0.0);
                         let vol = *self.volume.lock().unwrap_or_else(|e| e.into_inner());
                         let spd = *self.speed.lock().unwrap_or_else(|e| e.into_inner());
                         player.set_volume(vol);
@@ -492,6 +490,7 @@ impl AudioCore {
         *self.current_error.lock().unwrap() = None;
         *self.current_url.lock().unwrap() = Some(url.clone());
         *self.active_progressive.lock().unwrap() = None;
+        *self.seek_offset_secs.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
         if let Some(dur) = duration_hint {
             *self.current_duration.lock().unwrap() = dur;
         } else {
@@ -829,7 +828,8 @@ impl AudioCore {
             (0.0, false)
         } else if let Ok(player_guard) = self.player.lock() {
             if let Some(player) = player_guard.as_ref() {
-                (player.get_pos().as_secs_f64(), player.empty())
+                let offset = *self.seek_offset_secs.lock().unwrap_or_else(|e| e.into_inner());
+                (offset + player.get_pos().as_secs_f64(), player.empty())
             } else {
                 (0.0, true)
             }
