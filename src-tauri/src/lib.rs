@@ -124,6 +124,13 @@ fn toggle_maximize_window(window: tauri::Window) {
 }
 
 #[tauri::command]
+fn toggle_fullscreen_window(window: tauri::Window) {
+    if let Ok(is_fs) = window.is_fullscreen() {
+        let _ = window.set_fullscreen(!is_fs);
+    }
+}
+
+#[tauri::command]
 fn close_window(window: tauri::Window) {
     // Hide to system tray instead of closing process so playback continues
     set_webview_visibility(window.app_handle(), false);
@@ -357,6 +364,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             minimize_window,
             toggle_maximize_window,
+            toggle_fullscreen_window,
             close_window,
             exit_app,
             open_external,
