@@ -374,11 +374,45 @@ impl AudioCore {
         Ok(())
     }
 
+    fn resolve_duration(total_dur: Option<Duration>, duration_hint: Option<f64>) -> f64 {
+        let hint = duration_hint.filter(|d| d.is_finite() && *d > 0.0);
+        match (total_dur, hint) {
+            (Some(total), Some(h)) => {
+                let total_secs = total.as_secs_f64();
+                // If decoder-reported duration wildly diverges from metadata hint
+                // (e.g. VBR/fragmented stream misestimation), prefer the metadata hint.
+                if h > 1.0 && (total_secs - h).abs() > (h * 0.6).max(120.0) {
+                    h
+                } else {
+                    total_secs
+                }
+            }
+            (Some(total), None) => total.as_secs_f64(),
+            (None, Some(h)) => h,
+            (None, None) => 0.0,
+        }
+    }
+
+    fn clamp_seek_position(position_secs: f64, duration_secs: f64) -> f64 {
+        let pos = if position_secs.is_finite() {
+            position_secs.max(0.0)
+        } else {
+            0.0
+        };
+        if duration_secs.is_finite() && duration_secs > 0.0 {
+            pos.min((duration_secs - 0.1).max(0.0))
+        } else {
+            pos
+        }
+    }
+
     pub fn seek(&self, position_secs: f64) -> Result<(), String> {
         self.ensure_player()?;
-        let target_pos = Duration::from_secs_f64(position_secs.max(0.0));
+        let dur = *self.current_duration.lock().unwrap_or_else(|e| e.into_inner());
+        let clamped_pos = Self::clamp_seek_position(position_secs, dur);
+        let target_pos = Duration::from_secs_f64(clamped_pos);
         self.has_ended.store(false, Ordering::SeqCst);
-        if position_secs <= 1.0 {
+        if clamped_pos <= 1.0 {
             self.track_has_played.store(false, Ordering::SeqCst);
         }
 
@@ -389,9 +423,14 @@ impl AudioCore {
         if let Some(bytes_arc) = self.cached_bytes.lock().map_err(|e| e.to_string())?.clone() {
             let cursor = Cursor::new(bytes_arc.as_ref().clone());
             if let Ok(mut decoder) = Decoder::new(cursor) {
-                if target_pos > Duration::from_millis(50) {
-                    let _ = decoder.try_seek(target_pos);
-                }
+                let actual_offset = if target_pos > Duration::from_millis(50) {
+                    match decoder.try_seek(target_pos) {
+                        Ok(()) => clamped_pos,
+                        Err(_) => 0.0,
+                    }
+                } else {
+                    0.0
+                };
                 let channels = decoder.channels().get() as usize;
                 let (producer, consumer) = rtrb::RingBuffer::new(4096);
                 *self.consumer.lock().unwrap() = Some(consumer);
@@ -407,7 +446,7 @@ impl AudioCore {
                 if let Some(player) = self.player.lock().map_err(|e| e.to_string())?.as_ref() {
                     player.clear();
                     player.append(viz_source);
-                    *self.seek_offset_secs.lock().unwrap_or_else(|e| e.into_inner()) = position_secs.max(0.0);
+                    *self.seek_offset_secs.lock().unwrap_or_else(|e| e.into_inner()) = actual_offset;
                     let vol = *self.volume.lock().unwrap_or_else(|e| e.into_inner());
                     let spd = *self.speed.lock().unwrap_or_else(|e| e.into_inner());
                     player.set_volume(vol);
@@ -427,9 +466,14 @@ impl AudioCore {
             if self.load_generation.load(Ordering::SeqCst) == prog_gen {
                 let reader = ProgressiveReader::new(shared_prog, prog_gen);
                 if let Ok(mut decoder) = Decoder::new(reader) {
-                    if target_pos > Duration::from_millis(50) {
-                        let _ = decoder.try_seek(target_pos);
-                    }
+                    let actual_offset = if target_pos > Duration::from_millis(50) {
+                        match decoder.try_seek(target_pos) {
+                            Ok(()) => clamped_pos,
+                            Err(_) => 0.0,
+                        }
+                    } else {
+                        0.0
+                    };
                     let channels = decoder.channels().get() as usize;
                     let (producer, consumer) = rtrb::RingBuffer::new(4096);
                     *self.consumer.lock().unwrap() = Some(consumer);
@@ -445,7 +489,7 @@ impl AudioCore {
                     if let Some(player) = self.player.lock().map_err(|e| e.to_string())?.as_ref() {
                         player.clear();
                         player.append(viz_source);
-                        *self.seek_offset_secs.lock().unwrap_or_else(|e| e.into_inner()) = position_secs.max(0.0);
+                        *self.seek_offset_secs.lock().unwrap_or_else(|e| e.into_inner()) = actual_offset;
                         let vol = *self.volume.lock().unwrap_or_else(|e| e.into_inner());
                         let spd = *self.speed.lock().unwrap_or_else(|e| e.into_inner());
                         player.set_volume(vol);
@@ -757,10 +801,9 @@ impl AudioCore {
                 LoadedDecoder::Progressive(d) => (d.total_duration(), d.channels().get() as usize),
             };
 
-            if let Some(total) = total_dur {
-                *this.current_duration.lock().unwrap() = total.as_secs_f64();
-            } else if let Some(dur) = duration_hint {
-                *this.current_duration.lock().unwrap() = dur;
+            let resolved_dur = AudioCore::resolve_duration(total_dur, duration_hint);
+            if resolved_dur > 0.0 {
+                *this.current_duration.lock().unwrap() = resolved_dur;
             }
 
             let (producer, consumer) = rtrb::RingBuffer::new(4096);
@@ -983,5 +1026,28 @@ mod tests {
         assert_eq!(freq.len(), FFT_BIN_COUNT);
         // While paused, it should return zeroes
         assert!(freq.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn test_resolve_duration_prefers_hint_on_mismatch() {
+        // Metadata says 6:23 (383s), decoder misestimates 13:18 (798s)
+        let resolved = AudioCore::resolve_duration(Some(Duration::from_secs(798)), Some(383.0));
+        assert!((resolved - 383.0).abs() < 0.001);
+
+        // Compatible decoder duration is preserved
+        let compatible = AudioCore::resolve_duration(Some(Duration::from_secs(385)), Some(383.0));
+        assert!((compatible - 385.0).abs() < 0.001);
+
+        // Missing decoder duration falls back to hint
+        let fallback = AudioCore::resolve_duration(None, Some(240.0));
+        assert!((fallback - 240.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_clamp_seek_position() {
+        assert_eq!(AudioCore::clamp_seek_position(-5.0, 383.0), 0.0);
+        assert!((AudioCore::clamp_seek_position(500.0, 383.0) - 382.9).abs() < 0.001);
+        assert!((AudioCore::clamp_seek_position(120.0, 383.0) - 120.0).abs() < 0.001);
+        assert_eq!(AudioCore::clamp_seek_position(f64::NAN, 383.0), 0.0);
     }
 }

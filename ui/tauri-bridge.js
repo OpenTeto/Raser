@@ -300,7 +300,8 @@
       enumerable: true,
       get: () => _currentPosition,
       set: (val) => {
-        const target = Math.max(0, Number(val) || 0);
+        const raw = Math.max(0, Number(val) || 0);
+        const target = _currentDuration > 0 ? Math.min(raw, Math.max(0, _currentDuration - 0.1)) : raw;
         _currentPosition = target;
         lastDispatchedPos = target;
         lastSeekMs = performance.now();
