@@ -4676,7 +4676,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function safeSeekTo(targetTime) {
     if (!el.nativeAudio || !Number.isFinite(targetTime)) return;
-    const target = Math.max(0, targetTime);
+    const maxDur = typeof getReliableTrackDuration === 'function' ? getReliableTrackDuration() : 0;
+    const target = maxDur > 0
+      ? Math.min(Math.max(0, targetTime), Math.max(0, maxDur - 0.1))
+      : Math.max(0, targetTime);
     if (target <= 0.1) {
       scrubProgress = 0;
       scrubPrevKnobX = null;
