@@ -1,81 +1,54 @@
-# ⚡ Raser — Ultra-Lightweight Native Music Player
+# Raser
 
-<div align="center">
+Native Windows desktop music player built with Tauri v2 and Rust. Streams from YouTube Music and SoundCloud with a Material You 3 interface, synchronized lyrics, Discord Rich Presence, and native Windows media integration.
 
-  <img src="ui/assets/icon-512x512.png" width="128" height="128" alt="Raser Logo" />
+## Overview
 
-  <h3>The Fastest, Lightest & Most Elegant Music Streaming Experience</h3>
+Raser offloads audio decoding, streaming, and frequency analysis to a native Rust backend (`rodio`, `symphonia`, `rustfft`) instead of running Web Audio inside Chromium. When minimized to the system tray, UI render loops pause and memory is trimmed.
 
-  [![Release](https://img.shields.io/github/v/release/tetoverse/Raser?color=6366f1&style=for-the-badge)](https://github.com/tetoverse/Raser/releases)
-  [![Rust](https://img.shields.io/badge/Rust-1.90%2B-orange?style=for-the-badge&logo=rust)](https://www.rust-lang.org/)
-  [![Tauri](https://img.shields.io/badge/Tauri-v2-24c8db?style=for-the-badge&logo=tauri)](https://tauri.app/)
-  [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078d4?style=for-the-badge&logo=windows)](https://github.com/tetoverse/Raser/releases)
-  [![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
+| Metric | Raser | Typical Electron Player |
+| :--- | :--- | :--- |
+| Idle RAM (tray) | ~35–55 MB | 450–750 MB |
+| Active Playback RAM | ~75–110 MB | 600–950 MB |
+| Installer Size | ~8 MB | 120–180 MB |
+| Cold Start | < 0.6 s | 3.5–6.0 s |
+| Audio Engine | Rust (`rodio` + WASAPI) | Web Audio API |
 
-  <p align="center">
-    <b>Raser</b> is an ultra-modern, blazing-fast native music desktop player powered by <b>Tauri v2 + Rust</b> with a stunning <b>Material You 3 (M3)</b> design system. It combines YouTube Music & SoundCloud streaming, rich Discord Presence, synced lyrics, and native hardware performance while consuming a fraction of the memory of traditional Electron players.
-  </p>
+## Features
 
-</div>
+### Audio Engine
+- Native decoding and playback in Rust via `rodio` and `symphonia`, bypassing Chromium's audio process.
+- Lock-free FFT visualizer using `rustfft` and an `rtrb` ring buffer on a dedicated audio thread.
+- Progressive in-memory and local SSD stream caching for fast seeking.
+- Viewport prewarming for visible playlist tracks and dual-tier chunked streaming.
+- Background playback with suspended UI loops and working-set trimming when minimized to tray.
 
----
+### Interface and Lyrics
+- Dynamic accent palette extracted from the current track's album art.
+- Shared frame-paced render loop with pre-blurred offscreen ambient backgrounds (0% render CPU/GPU when paused).
+- Synchronized word-by-word and line-by-line lyrics, plus a fullscreen karaoke view.
+- Spotify playlist import with duration matching (`±5s` / `±15s`) and remix/live filtering.
 
-## 🌟 Why Raser? (Performance Benchmarks)
+### Windows Integration
+- Taskbar thumbnail toolbar (`ITaskbarList3`) for Previous, Play/Pause, and Next controls.
+- System tray minimization with global media hotkeys.
+- Windows Media Controls (SMTC) support for hardware media keys.
+- Discord Rich Presence showing current track, artist, elapsed time, and album art.
 
-Traditional music players (Spotify, YouTube Music Desktop, Electron-based players) consume massive system resources even when idling in the background. **Raser was engineered from the ground up to solve this.**
+## Download and Installation
 
-| Metric | Raser v1.x.x (Rust Audio Core) | Electron / Spotify Player | Difference |
-| :--- | :---: | :---: | :---: |
-| **Idle RAM (Background / Tray)** | **~35 - 55 MB** | 450 - 750 MB | **~10x Lighter** |
-| **Active Playback RAM** | **~75 - 110 MB** | 600 - 950 MB | **~8x Lighter** |
-| **Active CPU / GPU Usage** | **~1.5 - 3.5% CPU / < 5% GPU** | 8 - 18% CPU / 15 - 30% GPU | **~4-5x More Efficient** |
-| **Installer File Size** | **~8.0 MB** | 120 - 180 MB | **~15x Smaller** |
-| **Cold Start Time** | **< 0.6 seconds** | 3.5 - 6.0 seconds | **Instant** |
-| **Cold Stream Start (192 KB)** | **~1.3 - 1.8 seconds** | 4.0 - 8.0+ seconds | **~3-4x Faster** |
-| **Audio Engine** | **Native Rust (`rodio` + WASAPI)** | Web Audio API / Chromium | **Zero Audio Lag** |
+Download the latest Windows installer from the [Releases](https://github.com/tetoverse/Raser/releases/latest) page:
 
----
+- **NSIS Installer:** `Raser_<version>_x64-setup.exe`
+- **MSI Package:** `Raser_<version>_x64_en-US.msi`
 
-## ✨ Features
+Silent install:
 
-### 🎧 Pure Rust Audio Engine (Stage 3 Architecture)
-- **Zero Web Audio Overhead:** Audio decoding and streaming are handled natively in Rust via `rodio` and `symphonia`, bypassing Chromium's memory-heavy `AudioService` process.
-- **Lock-Free FFT Visualizer:** Audio frequencies are analyzed on a dedicated audio thread using `rustfft` and an `rtrb` lock-free ring buffer, providing 60 FPS buttery-smooth canvas visualizer waves with zero UI lag.
-- **Background Playback & Instant Sleep:** When minimized or hidden to the system tray, UI rendering loops are completely frozen, V8 memory is scrubbed via `--expose-gc`, and Windows working sets are trimmed.
-- **Gapless & Progressive Caching:** Remote streams are buffered progressively in-memory and persisted to local SSD cache (`~6 ms` warm read) for instant zero-latency seeking.
-- **150ms Visibility Prewarm & Dual-Tier Streaming:** Playlist tracks visible in the viewport for 150ms are automatically pre-resolved and persistently cached, while cold streams start in **~1.3–1.8s** via Dual-Tier chunked streaming.
+```cmd
+Raser_<version>_x64-setup.exe /S
+```
 
-### 🎨 Material You 3 (M3) Design & Ultra-Low GPU Pipeline
-- **Dynamic Palette Extraction:** UI accents automatically adapt to the dominant colors of the currently playing album art.
-- **Unified Frame Scheduler & Pre-Blurred Ambient Layers:** Album art ambient backgrounds are pre-blurred once onto an offscreen canvas (`96x96`) instead of running continuous 90px full-screen CSS blur shaders, while the visualizer, morphing M3 cover, and karaoke gradient share a single frame-paced render loop that sleeps between ticks (`0%` CPU/GPU when paused).
-- **Duration-Matched Spotify Resolution:** Imported Spotify playlists automatically cross-verify track durations (`±5s` / `±15s`) and filter out unwanted remix/live/cover variants for exact track matching.
-- **Morphing Album Art:** Fluid canvas transitions between tracks with glassmorphism and ambient lighting effects.
-- **Synchronized Karaoke Lyrics:** Word-by-word and line-by-line synchronized lyrics with real-time gradient follow and zero layout thrashing.
-- **TV Karaoke Mode:** Fullscreen karaoke view with live dynamic visual effects.
-
-### 🪟 Deep Windows Integration
-- **Taskbar Thumbnail Toolbar:** Hover over Raser in the Windows Taskbar to instantly access Prev, Play/Pause, and Next buttons via native Windows `ITaskbarList3` APIs.
-- **System Tray Minimization:** Close button hides Raser to the system tray with full background playback support and global hotkeys.
-- **Discord Rich Presence (RPC):** Native rich presence shows current song, artist name ("Listening to [Artist]"), dynamic time elapsed, and album art on your Discord profile.
-- **Windows Media Controls (SMTC):** Supports hardware keyboard media keys (Play, Pause, Stop, Next, Previous).
-
----
-
-## 📥 Download & Installation
-
-Head over to the **[Latest Release](https://github.com/tetoverse/Raser/releases/latest)** to download the installer:
-
-- **Standard Installer (Recommended):** [`Raser_1.x.x_x64-setup.exe`](https://github.com/tetoverse/Raser/releases/latest) (NSIS Installer)
-- **Enterprise / Windows Installer:** [`Raser_1.x.x_x64_en-US.msi`](https://github.com/tetoverse/Raser/releases/latest) (MSI Package)
-
-> **Silent Installation (CLI):**
-> ```cmd
-> Raser_1.x.x_x64-setup.exe /S
-> ```
-
----
-
-## ⌨️ Global Keyboard Shortcuts
+## Keyboard Shortcuts
 
 | Shortcut | Action |
 | :--- | :--- |
@@ -84,66 +57,55 @@ Head over to the **[Latest Release](https://github.com/tetoverse/Raser/releases/
 | `MediaTrackPrevious` / `Ctrl + Left` | Previous Track |
 | `MediaStop` | Stop Playback |
 | `Up` / `Down` | Volume Up / Down (5%) |
-| `Ctrl + F` | Quick Search Focus |
-| `Esc` | Close Modals / Clear Track Selection |
+| `Ctrl + F` | Focus Search |
+| `Esc` | Close Modals / Clear Selection |
 
----
-
-## 🛠️ Building From Source
+## Building from Source
 
 ### Prerequisites
-1. **Rust & Cargo:** Install via [rustup.rs](https://rustup.rs/) (Rust 1.90+ required).
-2. **Node.js:** v18+ with `npm` / `npx`.
-3. **C++ Build Tools:** Visual Studio C++ Build Tools with Windows 10/11 SDK.
+- [Rust](https://rustup.rs/) 1.90+
+- Node.js 18+
+- Visual Studio C++ Build Tools with Windows 10/11 SDK
 
-### Build Steps
+### Build
 
 ```bash
-# 1. Clone repository
 git clone https://github.com/tetoverse/Raser.git
 cd Raser
 
-# 2. Check Rust dependencies
 cd src-tauri
 cargo check
 
-# 3. Build Production Installer (EXE & MSI)
 cd ..
 npx @tauri-apps/cli build
 ```
 
-The resulting executables and installers will be generated under:
-`src-tauri/target/release/bundle/nsis/Raser_1.x.x_x64-setup.exe`
-`src-tauri/target/release/bundle/msi/Raser_1.x.x_x64_en-US.msi`
+Generated installers are placed in:
+- `src-tauri/target/release/bundle/nsis/Raser_<version>_x64-setup.exe`
+- `src-tauri/target/release/bundle/msi/Raser_<version>_x64_en-US.msi`
 
----
+## Project Structure
 
-## 📂 Project Architecture
-
-```
+```text
 Raser/
 ├── src-tauri/
 │   ├── src/
 │   │   ├── main.rs            # Application entry point
-│   │   ├── lib.rs             # Tauri command bridge & background monitors
-│   │   ├── audio_core.rs      # Native Rust Audio Engine (rodio, symphonia, FFT)
-│   │   ├── discord.rs         # Discord Rich Presence IPC integration
-│   │   ├── taskbar.rs         # Windows Taskbar thumbnail buttons (ITaskbarList3)
-│   │   ├── storage.rs         # Offline encrypted & atomic JSON storage
-│   │   └── updater.rs         # Auto-updater management
-│   ├── Cargo.toml             # Rust dependencies & compiler profile optimizations
-│   └── tauri.conf.json        # Tauri configuration & Chromium V8 flags
-└── ui/                        # Material You frontend (HTML5/CSS3/Vanilla JS)
+│   │   ├── lib.rs             # Tauri commands and background monitors
+│   │   ├── audio_core.rs      # Rust audio engine (rodio, symphonia, FFT)
+│   │   ├── discord.rs         # Discord Rich Presence IPC
+│   │   ├── taskbar.rs         # Windows taskbar thumbnail controls
+│   │   ├── storage.rs         # Local JSON storage
+│   │   └── updater.rs         # Auto-updater
+│   ├── Cargo.toml             # Rust dependencies and release profile
+│   └── tauri.conf.json        # Tauri and WebView2 configuration
+└── ui/
     ├── index.html
     ├── styles.css
     ├── app.js
-    └── tauri-bridge.js        # IPC binding between UI and Rust Audio Core
+    └── tauri-bridge.js        # IPC bindings to Rust backend
 ```
 
----
+## License
 
-## 📄 License
-
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
-
-Developed with ❤️ by **[tetoverse](https://github.com/tetoverse)**.
+MIT — see [LICENSE](LICENSE) for details.
